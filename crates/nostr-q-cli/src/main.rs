@@ -97,6 +97,16 @@ enum Cmd {
         #[command(subcommand)]
         cmd: DlqCmd,
     },
+    /// Serve Prometheus metrics (GET /metrics) for queue depth and relay health
+    Metrics {
+        /// Address to bind the metrics HTTP server to
+        #[arg(long, default_value = "127.0.0.1:9090")]
+        addr: String,
+        /// Also probe and export per-relay up/latency gauges on each scrape
+        /// (does a network health check, so it's opt-in)
+        #[arg(long)]
+        with_relays: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -252,6 +262,10 @@ async fn main() -> anyhow::Result<()> {
                 DlqCmd::List { queue } => commands::dlq_list_cmd(&ctx, queue),
                 DlqCmd::Retry { mid } => commands::dlq_retry_cmd(&ctx, &mid),
             }
+        }
+        Cmd::Metrics { addr, with_relays } => {
+            let ctx = Ctx::load(cli.config, cli.json)?;
+            commands::metrics(&ctx, &addr, with_relays).await
         }
     }
 }

@@ -5,16 +5,23 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use nostr_q::queue::{Delivery, QueueConfig, QueueMode};
-use nostr_q::relay::{NostrTransport, Transport};
-use nostr_q::store::Store;
+use nostr_q::relay::{NostrTransport, RelayHealth, Transport};
+use nostr_q::store::{QueueStats, Store};
 use nostr_q::NostrQ;
 use nostr_q_worker::{handlers::ExecHandler, run_worker, Handler, WorkerOptions};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{self, Config};
 
 // `store` and `json` are part of the Ctx public contract consumed by later
 // CLI tasks (queue/relay/publish/subscribe commands).
+//
+// `Clone` lets the metrics server hand each accepted connection its own
+// `Arc<Ctx>` so a spawned per-connection task never borrows from the accept
+// loop's stack frame (see `serve_metrics`).
+#[derive(Clone)]
 pub struct Ctx {
     pub config: Config,
     pub store: Arc<Store>,
@@ -565,6 +572,301 @@ pub fn dlq_retry_cmd(ctx: &Ctx, mid: &str) -> Result<()> {
     Ok(())
 }
 
+/// Escape a Prometheus label value: backslash, double-quote, and newline
+/// are the only characters the text exposition format requires escaping
+/// (https://prometheus.io/docs/instrumenting/exposition_formats/).
+fn escape_label_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Pure renderer for the `/metrics` endpoint: turns per-queue stats (and,
+/// optionally, per-relay health) into Prometheus text exposition format.
+/// Kept free of I/O so it's unit-testable without a server.
+pub fn render_prometheus(
+    queues: &[(String, QueueStats)],
+    relays: Option<&[RelayHealth]>,
+) -> String {
+    let mut out = String::new();
+
+    let gauge_family = |out: &mut String, name: &str, help: &str| {
+        out.push_str(&format!("# HELP {name} {help}\n"));
+        out.push_str(&format!("# TYPE {name} gauge\n"));
+    };
+
+    gauge_family(
+        &mut out,
+        "nostrq_queue_pending",
+        "Number of pending messages in the queue.",
+    );
+    for (name, stats) in queues {
+        out.push_str(&format!(
+            "nostrq_queue_pending{{queue=\"{}\"}} {}\n",
+            escape_label_value(name),
+            stats.pending
+        ));
+    }
+
+    gauge_family(
+        &mut out,
+        "nostrq_queue_in_flight",
+        "Number of claimed (in-flight) messages in the queue.",
+    );
+    for (name, stats) in queues {
+        out.push_str(&format!(
+            "nostrq_queue_in_flight{{queue=\"{}\"}} {}\n",
+            escape_label_value(name),
+            stats.in_flight
+        ));
+    }
+
+    gauge_family(
+        &mut out,
+        "nostrq_queue_acked",
+        "Number of acknowledged messages in the queue.",
+    );
+    for (name, stats) in queues {
+        out.push_str(&format!(
+            "nostrq_queue_acked{{queue=\"{}\"}} {}\n",
+            escape_label_value(name),
+            stats.acked
+        ));
+    }
+
+    gauge_family(
+        &mut out,
+        "nostrq_queue_dead",
+        "Number of dead-lettered messages in the queue.",
+    );
+    for (name, stats) in queues {
+        out.push_str(&format!(
+            "nostrq_queue_dead{{queue=\"{}\"}} {}\n",
+            escape_label_value(name),
+            stats.dead
+        ));
+    }
+
+    gauge_family(
+        &mut out,
+        "nostrq_queue_expired",
+        "Number of expired messages in the queue.",
+    );
+    for (name, stats) in queues {
+        out.push_str(&format!(
+            "nostrq_queue_expired{{queue=\"{}\"}} {}\n",
+            escape_label_value(name),
+            stats.expired
+        ));
+    }
+
+    gauge_family(
+        &mut out,
+        "nostrq_queue_oldest_pending_seconds",
+        "Age in seconds of the oldest pending message in the queue (0 when there is none).",
+    );
+    for (name, stats) in queues {
+        out.push_str(&format!(
+            "nostrq_queue_oldest_pending_seconds{{queue=\"{}\"}} {}\n",
+            escape_label_value(name),
+            stats.oldest_pending_age_secs.unwrap_or(0)
+        ));
+    }
+
+    if let Some(relays) = relays {
+        gauge_family(
+            &mut out,
+            "nostrq_relay_up",
+            "Whether the relay is currently connected (1) or not (0).",
+        );
+        for r in relays {
+            out.push_str(&format!(
+                "nostrq_relay_up{{url=\"{}\"}} {}\n",
+                escape_label_value(&r.url),
+                if r.connected { 1 } else { 0 }
+            ));
+        }
+
+        gauge_family(
+            &mut out,
+            "nostrq_relay_latency_ms",
+            "Relay round-trip latency in milliseconds (0 when unknown or down).",
+        );
+        for r in relays {
+            out.push_str(&format!(
+                "nostrq_relay_latency_ms{{url=\"{}\"}} {}\n",
+                escape_label_value(&r.url),
+                r.latency_ms.unwrap_or(0)
+            ));
+        }
+    }
+
+    out
+}
+
+/// Gather (queue, stats) for every configured queue, and — when
+/// `with_relays` is set — probe relay health too. Called fresh on every
+/// scrape so the endpoint always reflects live state.
+async fn gather_metrics(ctx: &Ctx, with_relays: bool) -> Result<String> {
+    let now = chrono::Utc::now().timestamp();
+    let mut queues = Vec::new();
+    for q in ctx.store.list_queues()? {
+        let stats = ctx.store.stats(&q.name, now)?;
+        queues.push((q.name, stats));
+    }
+    let relays = if with_relays {
+        let keys = config::load_keys(&ctx.config)?;
+        let relay_urls = ctx.store.list_relays()?;
+        let transport = NostrTransport::connect(keys, &relay_urls).await?;
+        Some(transport.health().await)
+    } else {
+        None
+    };
+    Ok(render_prometheus(&queues, relays.as_deref()))
+}
+
+/// Serve `GET /metrics` in Prometheus text exposition format over a raw
+/// TCP accept loop — no web framework needed for a single read-only
+/// endpoint. Runs until ctrl-c.
+pub async fn metrics(ctx: &Ctx, addr: &str, with_relays: bool) -> Result<()> {
+    let listener = TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("failed to bind {addr}"))?;
+    eprintln!("serving Prometheus metrics on http://{addr}/metrics — ctrl-c to stop");
+
+    let shutdown = CancellationToken::new();
+    let sd = shutdown.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        sd.cancel();
+    });
+
+    serve_metrics(listener, ctx, with_relays, shutdown).await
+}
+
+/// The accept loop itself, split out from [`metrics`] so tests can bind an
+/// ephemeral port, drive a handful of requests, and cancel the loop without
+/// waiting on a real ctrl-c.
+async fn serve_metrics(
+    listener: TcpListener,
+    ctx: &Ctx,
+    with_relays: bool,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    // Own an Arc<Ctx> for the lifetime of the accept loop so each accepted
+    // connection can be handed a cheap, 'static-compatible clone and handled
+    // in its own spawned task. This is what lets a slow/hung client be
+    // isolated from `accept()` and from the shutdown check below — without
+    // it, a single client that never sends data would block every future
+    // scrape (and ctrl-c) for as long as the connection stayed open.
+    let ctx = Arc::new(ctx.clone());
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                return Ok(());
+            }
+            accepted = listener.accept() => {
+                let (mut socket, _) = match accepted {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "metrics: accept failed");
+                        continue;
+                    }
+                };
+                let ctx = Arc::clone(&ctx);
+                // Spawn so a slow or hung client (e.g. a raw TCP connection
+                // that never sends a request line) can't stall `accept()`
+                // for the next scraper or delay the shutdown branch above.
+                tokio::spawn(async move {
+                    if let Err(e) = handle_metrics_request(&mut socket, &ctx, with_relays).await {
+                        tracing::warn!(error = %e, "metrics: request handling failed");
+                    }
+                });
+            }
+        }
+    }
+}
+
+/// Timeout for reading the request line and headers of a single connection.
+/// A well-behaved scraper sends its request immediately after connecting;
+/// this bounds how long a hung/slow client can hold a spawned task open.
+const METRICS_REQUEST_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+async fn handle_metrics_request(
+    socket: &mut tokio::net::TcpStream,
+    ctx: &Ctx,
+    with_relays: bool,
+) -> Result<()> {
+    let mut reader = BufReader::new(&mut *socket);
+    let mut request_line = String::new();
+    let n = match tokio::time::timeout(
+        METRICS_REQUEST_READ_TIMEOUT,
+        reader.read_line(&mut request_line),
+    )
+    .await
+    {
+        Ok(read_result) => read_result?,
+        Err(_) => {
+            tracing::debug!("metrics: timed out waiting for request line");
+            return Ok(()); // drop the connection rather than hang forever
+        }
+    };
+    if n == 0 {
+        return Ok(()); // client closed without sending anything
+    }
+    // Drain remaining header lines until the blank line so the connection
+    // can be reused-free-and-clear before we write the response (we don't
+    // keep-alive, but draining avoids writing into a half-read socket on
+    // some clients).
+    loop {
+        let mut line = String::new();
+        let n =
+            match tokio::time::timeout(METRICS_REQUEST_READ_TIMEOUT, reader.read_line(&mut line))
+                .await
+            {
+                Ok(read_result) => read_result?,
+                Err(_) => {
+                    tracing::debug!("metrics: timed out waiting for request headers");
+                    return Ok(()); // drop the connection rather than hang forever
+                }
+            };
+        if n == 0 || line == "\r\n" || line == "\n" {
+            break;
+        }
+    }
+
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let path = parts.next().unwrap_or("");
+
+    if method == "GET" && path == "/metrics" {
+        let body = gather_metrics(ctx, with_relays).await?;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        socket.write_all(response.as_bytes()).await?;
+    } else {
+        let body = "not found";
+        let response = format!(
+            "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        socket.write_all(response.as_bytes()).await?;
+    }
+    socket.flush().await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -860,4 +1162,203 @@ mod tests {
     // `crates/nostr-q-cli/tests/json_output.rs` (an integration test, since
     // `CARGO_BIN_EXE_nostr-q` is only available to targets other than the
     // bin's own unit tests).
+
+    // --- `nostr-q metrics` — Prometheus exporter (CHA-2346) ---
+
+    fn stats(pending: u32, in_flight: u32, acked: u32, dead: u32, expired: u32) -> QueueStats {
+        QueueStats {
+            pending,
+            in_flight,
+            acked,
+            dead,
+            expired,
+            oldest_pending_age_secs: None,
+        }
+    }
+
+    #[test]
+    fn render_prometheus_emits_help_type_and_values_per_queue() {
+        let queues = vec![
+            ("jobs.email".to_string(), stats(3, 1, 10, 2, 0)),
+            ("jobs.sms".to_string(), stats(0, 0, 5, 0, 1)),
+        ];
+        let body = render_prometheus(&queues, None);
+
+        assert!(body.contains("# HELP nostrq_queue_pending "));
+        assert!(body.contains("# TYPE nostrq_queue_pending gauge\n"));
+        assert!(body.contains("nostrq_queue_pending{queue=\"jobs.email\"} 3\n"));
+        assert!(body.contains("nostrq_queue_pending{queue=\"jobs.sms\"} 0\n"));
+
+        assert!(body.contains("nostrq_queue_in_flight{queue=\"jobs.email\"} 1\n"));
+        assert!(body.contains("nostrq_queue_acked{queue=\"jobs.email\"} 10\n"));
+        assert!(body.contains("nostrq_queue_dead{queue=\"jobs.email\"} 2\n"));
+        assert!(body.contains("nostrq_queue_expired{queue=\"jobs.sms\"} 1\n"));
+
+        // no relay families when relays is None.
+        assert!(!body.contains("nostrq_relay_up"));
+        assert!(!body.contains("nostrq_relay_latency_ms"));
+    }
+
+    #[test]
+    fn render_prometheus_maps_oldest_pending_none_to_zero() {
+        let mut with_age = stats(1, 0, 0, 0, 0);
+        with_age.oldest_pending_age_secs = Some(42);
+        let with_none = stats(0, 0, 0, 0, 0); // oldest_pending_age_secs: None
+
+        let queues = vec![
+            ("q.has-age".to_string(), with_age),
+            ("q.no-age".to_string(), with_none),
+        ];
+        let body = render_prometheus(&queues, None);
+
+        assert!(body.contains("nostrq_queue_oldest_pending_seconds{queue=\"q.has-age\"} 42\n"));
+        assert!(body.contains("nostrq_queue_oldest_pending_seconds{queue=\"q.no-age\"} 0\n"));
+    }
+
+    #[test]
+    fn render_prometheus_includes_relay_families_with_relays_and_maps_down_to_zero() {
+        let queues = vec![("jobs.email".to_string(), stats(1, 0, 0, 0, 0))];
+        let relays = vec![
+            RelayHealth {
+                url: "wss://relay.up.example".into(),
+                connected: true,
+                latency_ms: Some(37),
+            },
+            RelayHealth {
+                url: "wss://relay.down.example".into(),
+                connected: false,
+                latency_ms: None,
+            },
+        ];
+        let body = render_prometheus(&queues, Some(&relays));
+
+        assert!(body.contains("# TYPE nostrq_relay_up gauge\n"));
+        assert!(body.contains("nostrq_relay_up{url=\"wss://relay.up.example\"} 1\n"));
+        assert!(body.contains("nostrq_relay_up{url=\"wss://relay.down.example\"} 0\n"));
+
+        assert!(body.contains("# TYPE nostrq_relay_latency_ms gauge\n"));
+        assert!(body.contains("nostrq_relay_latency_ms{url=\"wss://relay.up.example\"} 37\n"));
+        assert!(body.contains("nostrq_relay_latency_ms{url=\"wss://relay.down.example\"} 0\n"));
+    }
+
+    #[test]
+    fn render_prometheus_escapes_label_values() {
+        let queues = vec![(
+            "weird\\name\"with\nnewline".to_string(),
+            stats(1, 0, 0, 0, 0),
+        )];
+        let body = render_prometheus(&queues, None);
+
+        assert!(
+            body.contains("nostrq_queue_pending{queue=\"weird\\\\name\\\"with\\nnewline\"} 1\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_server_serves_metrics_and_404s_other_paths() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpStream;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path().join("key"));
+        ctx.store
+            .upsert_queue(&QueueConfig::work_queue("jobs.email"))
+            .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = CancellationToken::new();
+        let sd = shutdown.clone();
+        let server = tokio::spawn(async move {
+            serve_metrics(listener, &ctx, false, sd).await.unwrap();
+        });
+
+        async fn get(addr: std::net::SocketAddr, path: &str) -> (String, String) {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream
+                .write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let mut buf = String::new();
+            stream.read_to_string(&mut buf).await.unwrap();
+            let mut parts = buf.splitn(2, "\r\n\r\n");
+            let head = parts.next().unwrap_or_default().to_string();
+            let body = parts.next().unwrap_or_default().to_string();
+            (head, body)
+        }
+
+        let (head, body) = get(addr, "/metrics").await;
+        assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
+        assert!(
+            head.contains("Content-Type: text/plain; version=0.0.4"),
+            "{head}"
+        );
+        assert!(body.contains("nostrq_queue_pending{queue=\"jobs.email\"} 0\n"));
+
+        let (head, _) = get(addr, "/other").await;
+        assert!(head.starts_with("HTTP/1.1 404"), "{head}");
+
+        shutdown.cancel();
+        // unblock the accept loop's select! so the spawned task can exit.
+        let _ = TcpStream::connect(addr).await;
+        server.await.unwrap();
+    }
+
+    /// Regression test for CHA-2346: a client that opens a TCP connection
+    /// and never sends any data must not block subsequent scrapes (or
+    /// shutdown). Before the fix, `handle_metrics_request` was awaited
+    /// inline in the accept loop with no timeout, so a single hung client
+    /// wedged the whole server.
+    #[tokio::test]
+    async fn hung_client_does_not_block_scrapes() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpStream;
+        use tokio::time::{timeout, Duration};
+
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path().join("key"));
+        ctx.store
+            .upsert_queue(&QueueConfig::work_queue("jobs.email"))
+            .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = CancellationToken::new();
+        let sd = shutdown.clone();
+        let server = tokio::spawn(async move {
+            serve_metrics(listener, &ctx, false, sd).await.unwrap();
+        });
+
+        // Open a connection and send nothing, keeping it open for the rest
+        // of the test — simulates a hung/malicious client.
+        let hung = TcpStream::connect(addr).await.unwrap();
+
+        // A well-behaved scraper connecting after the hung client must
+        // still be served promptly.
+        let scrape = async {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream
+                .write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n")
+                .await
+                .unwrap();
+            let mut buf = String::new();
+            stream.read_to_string(&mut buf).await.unwrap();
+            buf
+        };
+        let body = timeout(Duration::from_secs(5), scrape)
+            .await
+            .expect("scrape must not be blocked by the hung client");
+        assert!(body.starts_with("HTTP/1.1 200 OK"), "{body}");
+        assert!(body.contains("nostrq_queue_pending{queue=\"jobs.email\"} 0\n"));
+
+        drop(hung);
+        shutdown.cancel();
+        // unblock the accept loop's select! promptly (belt-and-suspenders;
+        // select! re-polls every branch each iteration regardless).
+        let _ = TcpStream::connect(addr).await;
+        timeout(Duration::from_secs(5), server)
+            .await
+            .expect("server task must join promptly after shutdown")
+            .unwrap();
+    }
 }

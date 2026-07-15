@@ -180,7 +180,30 @@ nostr-q worker <queue> --http <url>
 nostr-q inspect <queue>
 nostr-q trace <trace-id-or-message-id>
 nostr-q dlq list|retry
+nostr-q metrics --addr <host:port> [--with-relays]
 ```
+
+## Metrics
+
+`nostr-q metrics` serves a Prometheus text-exposition endpoint at `GET /metrics`,
+computed fresh from local queue state on every scrape:
+
+```sh
+nostr-q metrics --addr 127.0.0.1:9090
+curl -s localhost:9090/metrics
+```
+
+For each queue it emits gauges: `nostrq_queue_pending`, `nostrq_queue_in_flight`,
+`nostrq_queue_acked`, `nostrq_queue_dead`, `nostrq_queue_expired`, and
+`nostrq_queue_oldest_pending_seconds` (0 when there's no pending message), each
+labeled `queue="<name>"`.
+
+Pass `--with-relays` to additionally probe configured relays on every scrape and
+export `nostrq_relay_up` (1/0) and `nostrq_relay_latency_ms` (0 when down or
+unknown) labeled `url="<relay-url>"`. This does a live network health check per
+scrape, so it's opt-in.
+
+Any path other than `GET /metrics` returns `404`.
 
 ## Guarantees
 
