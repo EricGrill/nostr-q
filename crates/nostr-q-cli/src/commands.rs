@@ -17,6 +17,11 @@ use crate::config::{self, Config};
 
 // `store` and `json` are part of the Ctx public contract consumed by later
 // CLI tasks (queue/relay/publish/subscribe commands).
+//
+// `Clone` lets the metrics server hand each accepted connection its own
+// `Arc<Ctx>` so a spawned per-connection task never borrows from the accept
+// loop's stack frame (see `serve_metrics`).
+#[derive(Clone)]
 pub struct Ctx {
     pub config: Config,
     pub store: Arc<Store>,
@@ -755,6 +760,13 @@ async fn serve_metrics(
     with_relays: bool,
     shutdown: CancellationToken,
 ) -> Result<()> {
+    // Own an Arc<Ctx> for the lifetime of the accept loop so each accepted
+    // connection can be handed a cheap, 'static-compatible clone and handled
+    // in its own spawned task. This is what lets a slow/hung client be
+    // isolated from `accept()` and from the shutdown check below — without
+    // it, a single client that never sends data would block every future
+    // scrape (and ctrl-c) for as long as the connection stayed open.
+    let ctx = Arc::new(ctx.clone());
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => {
@@ -768,20 +780,24 @@ async fn serve_metrics(
                         continue;
                     }
                 };
-                // Re-gather via ctx (which is Sync-shared via &Ctx across
-                // the loop iterations — no clone needed since we don't
-                // spawn the handler as an independent task that outlives
-                // this borrow's scope) and respond inline. Requests are
-                // handled sequentially, which is fine for a low-QPS
-                // scrape endpoint.
-                let body_result = handle_metrics_request(&mut socket, ctx, with_relays).await;
-                if let Err(e) = body_result {
-                    tracing::warn!(error = %e, "metrics: request handling failed");
-                }
+                let ctx = Arc::clone(&ctx);
+                // Spawn so a slow or hung client (e.g. a raw TCP connection
+                // that never sends a request line) can't stall `accept()`
+                // for the next scraper or delay the shutdown branch above.
+                tokio::spawn(async move {
+                    if let Err(e) = handle_metrics_request(&mut socket, &ctx, with_relays).await {
+                        tracing::warn!(error = %e, "metrics: request handling failed");
+                    }
+                });
             }
         }
     }
 }
+
+/// Timeout for reading the request line and headers of a single connection.
+/// A well-behaved scraper sends its request immediately after connecting;
+/// this bounds how long a hung/slow client can hold a spawned task open.
+const METRICS_REQUEST_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 async fn handle_metrics_request(
     socket: &mut tokio::net::TcpStream,
@@ -790,7 +806,18 @@ async fn handle_metrics_request(
 ) -> Result<()> {
     let mut reader = BufReader::new(&mut *socket);
     let mut request_line = String::new();
-    let n = reader.read_line(&mut request_line).await?;
+    let n = match tokio::time::timeout(
+        METRICS_REQUEST_READ_TIMEOUT,
+        reader.read_line(&mut request_line),
+    )
+    .await
+    {
+        Ok(read_result) => read_result?,
+        Err(_) => {
+            tracing::debug!("metrics: timed out waiting for request line");
+            return Ok(()); // drop the connection rather than hang forever
+        }
+    };
     if n == 0 {
         return Ok(()); // client closed without sending anything
     }
@@ -800,7 +827,16 @@ async fn handle_metrics_request(
     // some clients).
     loop {
         let mut line = String::new();
-        let n = reader.read_line(&mut line).await?;
+        let n =
+            match tokio::time::timeout(METRICS_REQUEST_READ_TIMEOUT, reader.read_line(&mut line))
+                .await
+            {
+                Ok(read_result) => read_result?,
+                Err(_) => {
+                    tracing::debug!("metrics: timed out waiting for request headers");
+                    return Ok(()); // drop the connection rather than hang forever
+                }
+            };
         if n == 0 || line == "\r\n" || line == "\n" {
             break;
         }
@@ -1266,5 +1302,63 @@ mod tests {
         // unblock the accept loop's select! so the spawned task can exit.
         let _ = TcpStream::connect(addr).await;
         server.await.unwrap();
+    }
+
+    /// Regression test for CHA-2346: a client that opens a TCP connection
+    /// and never sends any data must not block subsequent scrapes (or
+    /// shutdown). Before the fix, `handle_metrics_request` was awaited
+    /// inline in the accept loop with no timeout, so a single hung client
+    /// wedged the whole server.
+    #[tokio::test]
+    async fn hung_client_does_not_block_scrapes() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpStream;
+        use tokio::time::{timeout, Duration};
+
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path().join("key"));
+        ctx.store
+            .upsert_queue(&QueueConfig::work_queue("jobs.email"))
+            .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = CancellationToken::new();
+        let sd = shutdown.clone();
+        let server = tokio::spawn(async move {
+            serve_metrics(listener, &ctx, false, sd).await.unwrap();
+        });
+
+        // Open a connection and send nothing, keeping it open for the rest
+        // of the test — simulates a hung/malicious client.
+        let hung = TcpStream::connect(addr).await.unwrap();
+
+        // A well-behaved scraper connecting after the hung client must
+        // still be served promptly.
+        let scrape = async {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream
+                .write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n")
+                .await
+                .unwrap();
+            let mut buf = String::new();
+            stream.read_to_string(&mut buf).await.unwrap();
+            buf
+        };
+        let body = timeout(Duration::from_secs(5), scrape)
+            .await
+            .expect("scrape must not be blocked by the hung client");
+        assert!(body.starts_with("HTTP/1.1 200 OK"), "{body}");
+        assert!(body.contains("nostrq_queue_pending{queue=\"jobs.email\"} 0\n"));
+
+        drop(hung);
+        shutdown.cancel();
+        // unblock the accept loop's select! promptly (belt-and-suspenders;
+        // select! re-polls every branch each iteration regardless).
+        let _ = TcpStream::connect(addr).await;
+        timeout(Duration::from_secs(5), server)
+            .await
+            .expect("server task must join promptly after shutdown")
+            .unwrap();
     }
 }
