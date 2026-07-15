@@ -785,6 +785,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
 
 [[package]]
+name = "hex"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
 name = "hex-conservative"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1182,6 +1188,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
+name = "lru"
+version = "0.16.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1232,12 +1244,6 @@ dependencies = [
 
 [[package]]
 name = "negentropy"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e664971378a3987224f7a0e10059782035e89899ae403718ee07de85bec42afe"
-
-[[package]]
-name = "negentropy"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0efe882e02d206d8d279c20eb40e03baf7cb5136a1476dc084a324fbc3ec42d"
@@ -1266,13 +1272,47 @@ dependencies = [
 ]
 
 [[package]]
-name = "nostr-database"
-version = "0.39.0"
+name = "nostr"
+version = "0.44.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce07b47c77b8e5a856727885fe0ae47b9aa53d8d853a2190dd479b5a0d6e4f52"
+checksum = "98cf5d15d70d1f8f4059e5f79923ac15891eb691d2843d01191e0585fb064d70"
 dependencies = [
- "nostr",
+ "base64",
+ "bech32",
+ "bip39",
+ "bitcoin_hashes",
+ "cbc",
+ "chacha20",
+ "chacha20poly1305",
+ "getrandom 0.2.17",
+ "hex",
+ "instant",
+ "scrypt",
+ "secp256k1",
+ "serde",
+ "serde_json",
+ "unicode-normalization",
+ "url",
+]
+
+[[package]]
+name = "nostr-database"
+version = "0.44.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7462c9d8ae5ef6a28d66a192d399ad2530f1f2130b13186296dbb11bdef5b3d1"
+dependencies = [
+ "lru",
+ "nostr 0.44.4",
  "tokio",
+]
+
+[[package]]
+name = "nostr-gossip"
+version = "0.44.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ade30de16869618919c6b5efc8258f47b654a98b51541eb77f85e8ec5e3c83a6"
+dependencies = [
+ "nostr 0.44.4",
 ]
 
 [[package]]
@@ -1281,7 +1321,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
- "nostr",
+ "nostr 0.39.0",
  "nostr-q-core",
  "nostr-q-relay",
  "nostr-q-store",
@@ -1300,7 +1340,7 @@ dependencies = [
  "chrono",
  "clap",
  "dirs",
- "nostr",
+ "nostr 0.39.0",
  "nostr-q",
  "nostr-q-worker",
  "serde",
@@ -1318,7 +1358,7 @@ name = "nostr-q-core"
 version = "0.1.0"
 dependencies = [
  "chrono",
- "nostr",
+ "nostr 0.39.0",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -1331,7 +1371,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "nostr",
+ "nostr 0.39.0",
  "nostr-q-core",
  "nostr-sdk",
  "serde",
@@ -1359,7 +1399,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
- "nostr",
+ "nostr 0.39.0",
  "nostr-q",
  "reqwest",
  "serde_json",
@@ -1372,16 +1412,17 @@ dependencies = [
 
 [[package]]
 name = "nostr-relay-pool"
-version = "0.39.0"
+version = "0.44.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "211ac5bbdda1a8eec0c21814a838da832038767a5d354fe2fcc1ca438cae56fd"
+checksum = "91b2c039df4f96c4bf7dae52a74fd5516ad6dda83a11c0c69dea91b5255a4f37"
 dependencies = [
  "async-utility",
  "async-wsocket",
  "atomic-destructor",
- "negentropy 0.3.1",
- "negentropy 0.5.0",
- "nostr",
+ "hex",
+ "lru",
+ "negentropy",
+ "nostr 0.44.4",
  "nostr-database",
  "tokio",
  "tracing",
@@ -1389,13 +1430,14 @@ dependencies = [
 
 [[package]]
 name = "nostr-sdk"
-version = "0.39.0"
+version = "0.44.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5baca581deb810a88bb51c54d1d7980f4506a64a3e9a19270829b406e47adf31"
+checksum = "471732576710e779b64f04c55e3f8b5292f865fea228436daf19694f0bf70393"
 dependencies = [
  "async-utility",
- "nostr",
+ "nostr 0.44.4",
  "nostr-database",
+ "nostr-gossip",
  "nostr-relay-pool",
  "tokio",
  "tracing",
