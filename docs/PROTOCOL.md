@@ -155,6 +155,107 @@ the current floor was set) always carries `attempt > attempt_floor` —
 terminal. A worker that never observed the retry (`attempt_floor == 0`)
 correctly treats any real dlq event (`attempt >= 1`) as terminal.
 
+This rule also has to hold for a node that never nacked the message
+itself and only *observed* someone else's dlq event. When that happens,
+`try_claim` heals the local `attempts` counter up to the observed dlq
+event's `attempt` generation before marking the row dead
+(`Store::move_to_dlq_at`), the same MAX-healing pattern `mark_claimed`
+uses for claims. Without this, a node whose local `attempts` was still 0
+(because it never nacked) would set `attempt_floor = attempts = 0` on its
+next `dlq retry`, and the very same historical dlq event — whose
+`attempt` tag is still greater than that stale floor — would immediately
+re-trip the terminal check above on the next claim survey, silently
+undoing the retry. Healing `attempts` first means the floor `dlq_retry`
+sets is high enough that the historical event is no longer terminal.
+
+### Protocol versioning note
+
+Dead-letter events (kind 4624) carry an `attempt` tag recording the global
+attempt/retry generation at dead-letter time (see the DLQ-terminal rule
+above). `event_attempt` (`crates/nostr-q-core/src/protocol.rs`) parses this
+tag defensively: an older Nostr-Q implementation, or any other
+implementation that omits the `attempt` tag on a 4624 event, is parsed as
+`attempt = 0`. Since the DLQ-terminal check requires `attempt >
+attempt_floor` (and `attempt_floor` starts at 0), a tagless dlq event is
+never terminal on a node whose row has never been retried — it is treated
+as informational rather than authoritative. Implementations that want their
+dead-letter events to be reliably terminal for other Nostr-Q nodes must set
+the `attempt` tag.
+
+## Local state is per-node
+
+Every Nostr-Q node — producer, worker, or CLI invocation — keeps its own
+SQLite state (`Store`). There is no shared or global database, and no node
+ever ingests or replays another node's full history. This is by design
+(SRS §10: state is local operational bookkeeping, not a source of truth for
+the queue), but it has consequences operators must understand:
+
+- **A node's rows reflect only what that node has published, ingested, or
+  observed.** `insert_message` runs when a node either publishes a message
+  itself or has an active subscription/worker ingest loop (`spawn_ingest`)
+  running against a queue. A node that has never subscribed to a queue has
+  no rows for it at all, regardless of how much traffic has flowed through
+  that queue on the relay.
+- **Ack/DLQ lifecycle events are consumed opportunistically, not globally
+  ingested.** A node only learns that some *other* node acked or
+  dead-lettered a message when its own `try_claim` terminal-state check
+  (phase 1, above) happens to query the relay for that specific message —
+  which only happens while the node still has a `pending`/`claimed` local
+  row for it and is actively polling. A pure producer (or a worker that
+  never lost a claim race for that message) never runs this check, and so
+  never local-syncs the outcome.
+- **A producer-only node keeps rows `pending` indefinitely.** If a node
+  only ever calls `publish` and never runs a worker/ingest loop against
+  that queue, its local rows for the messages it published stay `pending`
+  forever in its own database — even after some other node's worker acks
+  or dead-letters them on the relay. This is expected, not a bug: the
+  producer's local state was never wired to observe that lifecycle.
+- **`nostr-q inspect` stats are that node's local view, not global truth.**
+  Depth, in-flight, and DLQ counts reported by `inspect` (and by
+  `dlq list`/`dlq retry`) are computed entirely from the invoking node's
+  own SQLite file. Two nodes pointed at the same queue on the same relay(s)
+  can — and routinely will — report different numbers. Neither is "wrong";
+  each is an accurate reflection of that node's own participation.
+
+**Operationally**, this means:
+
+- Don't use one node's `inspect` output as a global dashboard for a queue
+  unless that node runs a worker/ingest loop against every queue you care
+  about and you accept eventual (not real-time) convergence with other
+  nodes' views.
+- If you need a global view, aggregate relay-level truth directly (query
+  the relay for all lifecycle events on a queue) rather than trusting any
+  single node's local database.
+- `dlq retry` only requeues the row in the *retrying node's* local
+  database. See the "DLQ-terminal rule" section above — including how a
+  node that only *observed* a remote dlq event (rather than dead-lettering
+  the message itself) still gets a correctly-healed retry floor.
+
+## One keypair per worker instance
+
+> **Warning:** Never share `NOSTR_Q_PRIVATE_KEY` (or a `key_file`) across
+> more than one running worker instance.
+
+Claim-winner identity in the protocol is decided by **claimer pubkey**
+(see "Claim protocol" above: "Winner identity ... is compared by claimer
+pubkey, not claim event id"). If two worker processes are configured with
+the same private key, every claim event either of them publishes carries
+the identical pubkey, so from the relay's point of view they are
+indistinguishable — and from each worker's own point of view, *any* claim
+tagged with "our" pubkey looks like a claim *we* won, including the one
+the other instance just published. Both instances will conclude they won
+the same claim and will both run the handler, duplicating all processing
+for every message the queue delivers. This defeats the entire
+competing-consumer mechanism and is not caught by any retry, lease, or
+ack/nack logic — it looks like normal single-winner claiming from each
+instance's own perspective.
+
+Give each worker **instance** (or, at minimum, each machine) its own
+keypair (`nostr-q key generate`). It is fine — expected, even — for a
+producer and its downstream workers to use different keys, and for
+multiple distinct workers on the same queue to use different keys; that is
+what makes them "competing consumers" in the first place.
+
 ## Delivery guarantees
 
 Work queues are **at-least-once**: duplicate processing is possible. Known

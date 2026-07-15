@@ -226,8 +226,21 @@ impl NostrQ {
             .max();
         if let Some(dlq_attempt) = max_remote_dlq_attempt {
             if dlq_attempt > rec.attempt_floor {
-                self.store
-                    .move_to_dlq(&rec.mid, "dead-lettered by remote worker")?;
+                // Heal local `attempts` up to the observed DLQ generation
+                // (mirrors `mark_claimed`'s MAX(attempts, ?) pattern). This
+                // worker never nacked this message itself, so `attempts`
+                // may still be behind the generation the remote worker
+                // dead-lettered at; without healing it here, a later
+                // `dlq_retry` would set `attempt_floor = attempts` at the
+                // stale (too-low) value, and this same historical dlq event
+                // would immediately re-trip the terminal check above on the
+                // very next claim survey — a silent no-op flip-flop. See
+                // `Store::move_to_dlq_at`.
+                self.store.move_to_dlq_at(
+                    &rec.mid,
+                    "dead-lettered by remote worker",
+                    dlq_attempt,
+                )?;
                 self.store.record_lifecycle(
                     &rec.mid,
                     &rec.trace_id,
@@ -1005,6 +1018,106 @@ mod tests {
             nq.nack(&receipt.mid, "f4").await.unwrap(),
             NackOutcome::DeadLettered,
             "budget exhausts after max_attempts relative failures"
+        );
+    }
+
+    #[tokio::test]
+    async fn observed_remote_dlq_heals_local_attempts_so_retry_is_not_re_killed() {
+        // Regression for CHA-2271: a node that marks a row dead purely by
+        // OBSERVING a remote DLQ event (never nacked it itself) must heal
+        // its local `attempts` counter to the observed DLQ generation. If
+        // it doesn't, a later `dlq_retry` on that same node sets
+        // `attempt_floor = attempts` at the stale (too-low) value, and the
+        // very same historical DLQ event (whose `attempt` tag is now still
+        // greater than the new floor) immediately re-kills the row on the
+        // next claim survey — a silent no-op flip-flop.
+        let transport = Arc::new(MockTransport::new());
+        let mk = |t: Arc<MockTransport>| {
+            let store = Arc::new(Store::open_in_memory().unwrap());
+            let mut q = QueueConfig::work_queue("jobs.email");
+            q.max_attempts = 1; // one nack is enough to dead-letter
+            store.upsert_queue(&q).unwrap();
+            NostrQ::new(Keys::generate(), store, t)
+        };
+        let producer = mk(transport.clone());
+        let node_a = mk(transport.clone());
+        let node_b = mk(transport.clone());
+        let _ia = node_a.spawn_ingest("jobs.email").await.unwrap();
+        let _ib = node_b.spawn_ingest("jobs.email").await.unwrap();
+        let receipt = producer
+            .publish("jobs.email", json!({"n": 1}), None)
+            .await
+            .unwrap();
+        for w in [&node_a, &node_b] {
+            for _ in 0..40 {
+                if w.store().get_message(&receipt.mid).unwrap().is_some() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+
+        // Node A claims and nacks once, which (with max_attempts=1)
+        // dead-letters the message and publishes a kind-4624 event tagged
+        // with attempt=1.
+        let ra = node_a.store().get_message(&receipt.mid).unwrap().unwrap();
+        assert!(node_a.try_claim(&ra, 60, 10).await.unwrap());
+        assert_eq!(
+            node_a.nack(&receipt.mid, "boom").await.unwrap(),
+            NackOutcome::DeadLettered
+        );
+
+        // Node B never claimed or nacked (local attempts still 0). Its next
+        // try_claim observes A's remote DLQ event in the terminal check and
+        // marks the row dead locally, healing attempts to the observed
+        // generation (1), not leaving it at 0.
+        let rb = node_b.store().get_message(&receipt.mid).unwrap().unwrap();
+        assert_eq!(rb.attempts, 0);
+        assert!(!node_b.try_claim(&rb, 60, 10).await.unwrap());
+        let rb_dead = node_b.store().get_message(&receipt.mid).unwrap().unwrap();
+        assert_eq!(rb_dead.status, "dead");
+        assert_eq!(
+            rb_dead.attempts, 1,
+            "observing a remote dlq event must heal local attempts to its generation"
+        );
+
+        // Operator retries on Node B (the node that observed the DLQ event,
+        // not the one that dead-lettered it).
+        node_b.store().dlq_retry(&receipt.mid).unwrap();
+        let rb_retried = node_b.store().get_message(&receipt.mid).unwrap().unwrap();
+        assert_eq!(rb_retried.status, "pending");
+        assert_eq!(
+            rb_retried.attempt_floor, 1,
+            "retry floor must be set from the healed attempts value"
+        );
+
+        // The historical DLQ event (attempt=1) is still on the relay
+        // forever, but it must no longer be terminal: Node B's retry must
+        // win the claim and let it actually process the message, not be
+        // silently re-killed by the same stale event.
+        assert!(
+            node_b.try_claim(&rb_retried, 60, 10).await.unwrap(),
+            "post-retry claim on the observing node must win, not be re-killed by the historical dlq event"
+        );
+        assert_eq!(
+            node_b
+                .store()
+                .get_message(&receipt.mid)
+                .unwrap()
+                .unwrap()
+                .status,
+            "claimed"
+        );
+        node_b.ack(&receipt.mid).await.unwrap();
+        assert_eq!(
+            node_b
+                .store()
+                .get_message(&receipt.mid)
+                .unwrap()
+                .unwrap()
+                .status,
+            "acked",
+            "node B must be able to fully process the message after its retry"
         );
     }
 

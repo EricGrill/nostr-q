@@ -48,6 +48,22 @@ relays you can run yourself.
   <img src="docs/assets/architecture.svg" alt="Nostr-Q architecture diagram" width="100%">
 </p>
 
+> **Local state is per-node.** Each Nostr-Q node keeps its own SQLite
+> database reflecting only what *that node* has published, ingested, or
+> observed — there is no shared or global store. A producer-only node's
+> rows can stay `pending` forever even after another node's worker acks or
+> dead-letters them, and `nostr-q inspect`/`dlq list` report that node's
+> local view, not global truth. This is by design; see
+> [docs/PROTOCOL.md](docs/PROTOCOL.md#local-state-is-per-node) for details
+> and operational guidance.
+>
+> **One keypair per worker instance.** Claim-winner identity is decided by
+> claimer pubkey. Two worker instances sharing the same
+> `NOSTR_Q_PRIVATE_KEY` will both believe they won every claim and will
+> **duplicate all processing**. Give each worker instance (or at least each
+> machine) its own key with `nostr-q key generate`. See
+> [docs/PROTOCOL.md](docs/PROTOCOL.md#one-keypair-per-worker-instance).
+
 Nostr-Q has a small, layered workspace:
 
 ```text
