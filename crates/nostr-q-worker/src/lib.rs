@@ -1,6 +1,7 @@
 pub mod handlers;
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -90,6 +91,24 @@ pub async fn run_worker(
     let semaphore = Arc::new(Semaphore::new(opts.concurrency));
     tracing::info!(queue = %queue, concurrency = opts.concurrency, "worker started");
 
+    // The local row for a claimed-but-not-yet-settled message stays `pending`
+    // until try_claim's settle sleep elapses, so consecutive polls (every
+    // poll_ms) can re-fetch the same claimable row and spawn a second task
+    // for it. With pubkey-based claim identity, both tasks then "win" the
+    // same claim and the handler would run twice. Guard against spawning a
+    // second task for a mid that already has one in flight.
+    let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+
+    struct InFlightGuard {
+        set: Arc<Mutex<HashSet<String>>>,
+        mid: String,
+    }
+    impl Drop for InFlightGuard {
+        fn drop(&mut self) {
+            self.set.lock().unwrap().remove(&self.mid);
+        }
+    }
+
     while !shutdown.is_cancelled() {
         let now = chrono::Utc::now().timestamp();
         let batch = nq.store().claimable(&queue, now, opts.concurrency as u32)?;
@@ -101,15 +120,29 @@ pub async fn run_worker(
             continue;
         }
         for rec in batch {
+            if !in_flight.lock().unwrap().insert(rec.mid.clone()) {
+                // already being processed by an in-flight task from a prior
+                // poll; the local row hasn't settled yet — skip it.
+                continue;
+            }
             let permit = match semaphore.clone().try_acquire_owned() {
                 Ok(p) => p,
-                Err(_) => break, // all slots busy; re-poll after they free up
+                Err(_) => {
+                    // all slots busy; re-poll after they free up
+                    in_flight.lock().unwrap().remove(&rec.mid);
+                    break;
+                }
             };
             let nq = nq.clone();
             let handler = handler.clone();
             let (lease, settle) = (opts.lease_seconds, opts.settle_ms);
+            let guard = InFlightGuard {
+                set: in_flight.clone(),
+                mid: rec.mid.clone(),
+            };
             tokio::spawn(async move {
                 let _permit = permit;
+                let _guard = guard;
                 match nq.try_claim(&rec, lease, settle).await {
                     Ok(true) => {
                         let job = JobContext::from_record(&rec);
@@ -377,5 +410,70 @@ mod tests {
             HandlerOutcome::Failure(reason) => assert!(reason.contains("500"), "{reason}"),
             HandlerOutcome::Success => panic!("expected failure"),
         }
+    }
+
+    struct CountingHandler {
+        calls: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    #[async_trait::async_trait]
+    impl Handler for CountingHandler {
+        async fn handle(&self, _job: &JobContext) -> HandlerOutcome {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            HandlerOutcome::Success
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrency_does_not_double_execute_a_job() {
+        let nq = make_nq();
+        let receipt = nq
+            .publish("jobs.email", json!({"n": 1}), None)
+            .await
+            .unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let shutdown = CancellationToken::new();
+        let opts = WorkerOptions {
+            concurrency: 4,
+            lease_seconds: 60,
+            heartbeat_seconds: 3600,
+            settle_ms: 200, // settle longer than poll: the exact window that double-executed
+            poll_ms: 50,
+        };
+        let handle = tokio::spawn(run_worker(
+            nq.clone(),
+            "jobs.email".into(),
+            Arc::new(CountingHandler {
+                calls: calls.clone(),
+            }),
+            opts,
+            shutdown.clone(),
+        ));
+        let mut acked = false;
+        for _ in 0..100 {
+            if nq
+                .store()
+                .get_message(&receipt.mid)
+                .unwrap()
+                .unwrap()
+                .status
+                == "acked"
+            {
+                acked = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        // allow any duplicate task to fire before shutdown
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        shutdown.cancel();
+        handle.await.unwrap().unwrap();
+        assert!(acked);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a job must execute exactly once per process even at concurrency > 1"
+        );
     }
 }
