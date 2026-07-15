@@ -29,6 +29,21 @@ pub struct PublishReceipt {
     pub event_id: String,
 }
 
+/// Optional scheduling knobs for `publish_opts`.
+///
+/// `Default` leaves both unset, matching `publish`'s existing behavior
+/// (immediately claimable, never expires) exactly.
+#[derive(Debug, Clone, Default)]
+pub struct PublishOptions {
+    /// Not-before (unix seconds): the message is not claimable until this
+    /// time (delayed delivery). Carried on the wire as the `nbf` tag.
+    pub not_before: Option<i64>,
+    /// Expiry (unix seconds): the message must not be claimed once this
+    /// time has passed (TTL). Carried on the wire as the reserved `exp`
+    /// tag.
+    pub expires_at: Option<i64>,
+}
+
 #[derive(Debug, PartialEq)]
 pub enum NackOutcome {
     Retry { attempt: u32, visible_at: i64 },
@@ -75,6 +90,17 @@ impl NostrQ {
         body: Value,
         idem: Option<String>,
     ) -> Result<PublishReceipt> {
+        self.publish_opts(queue, body, idem, PublishOptions::default())
+            .await
+    }
+
+    pub async fn publish_opts(
+        &self,
+        queue: &str,
+        body: Value,
+        idem: Option<String>,
+        opts: PublishOptions,
+    ) -> Result<PublishReceipt> {
         let config = self.store.get_queue(queue)?.ok_or_else(|| {
             anyhow!("unknown queue '{queue}' - create it with `nostr-q queue create {queue}`")
         })?;
@@ -96,6 +122,8 @@ impl NostrQ {
             attempt: 0,
             idem: idem.clone(),
             envelope: Envelope::new(body),
+            not_before: opts.not_before,
+            expires_at: opts.expires_at,
         };
         let event = build_message_event(&self.keys, config.mode, &msg)?;
         let event_id = self.transport.publish(event).await?;
@@ -115,7 +143,8 @@ impl NostrQ {
             attempts: 0,
             attempt_floor: 0,
             idem_key: idem,
-            visible_at: 0,
+            visible_at: opts.not_before.unwrap_or(0),
+            expires_at: opts.expires_at,
             created_at: Self::now(),
         };
         let inserted = self.store.insert_message(&rec)?;
@@ -183,6 +212,20 @@ impl NostrQ {
         settle_ms: u64,
     ) -> Result<bool> {
         let now = Self::now();
+
+        // ---- Phase 0: TTL check ----------------------------------------
+        // A message whose `expires_at` has already passed must never be
+        // claimed, even if it was never claimed before (a claim survey
+        // alone wouldn't catch this — there may be no claims at all).
+        // Mark it (and any other due row on the same queue) expired
+        // locally and stop before doing any relay I/O.
+        if let Some(expires_at) = rec.expires_at {
+            if expires_at <= now {
+                self.expire_and_log(&rec.queue, now)?;
+                return Ok(false);
+            }
+        }
+
         let lease_expires_at = now + lease_seconds as i64;
         let message_event_id = EventId::from_hex(&rec.event_id)?;
         let our_pubkey = self.keys.public_key();
@@ -452,6 +495,35 @@ impl NostrQ {
         Ok(rx)
     }
 
+    /// Mark every pending/claimed row on `queue` whose `expires_at` has
+    /// passed `now` as `'expired'`, recording a lifecycle event for each.
+    /// Shared by `try_claim`'s TTL check (which needs a single due row
+    /// handled inline) and `sweep_expired` (which needs the whole queue
+    /// swept once per poll cycle, including messages that were never
+    /// claimed at all).
+    fn expire_and_log(&self, queue: &str, now: i64) -> Result<u32> {
+        let mids = self.store.expire_due(queue, now)?;
+        for mid in &mids {
+            if let Ok(Some(trace_id)) = self.store.trace_id_for_mid(mid) {
+                let _ = self
+                    .store
+                    .record_lifecycle(mid, &trace_id, "expired", "ttl exceeded");
+            }
+        }
+        Ok(mids.len() as u32)
+    }
+
+    /// Sweep `queue` for expired messages and mark them terminal.
+    ///
+    /// `try_claim`'s TTL check only catches a message once some worker
+    /// polls it, so a message that is never claimed (e.g. every worker is
+    /// busy, or the queue is idle) would otherwise never transition out of
+    /// `pending` once its TTL passes. Workers should call this once per
+    /// poll cycle so TTL is enforced independent of claim activity.
+    pub async fn sweep_expired(&self, queue: &str) -> Result<u32> {
+        self.expire_and_log(queue, Self::now())
+    }
+
     pub async fn heartbeat(&self, queue: &str) -> Result<()> {
         let event = nostr_q_core::protocol::build_heartbeat_event(&self.keys, queue)?;
         self.transport.publish(event).await?;
@@ -500,7 +572,8 @@ impl NostrQ {
                     attempts: msg.attempt,
                     attempt_floor: 0,
                     idem_key: msg.idem.clone(),
-                    visible_at: 0,
+                    visible_at: msg.not_before.unwrap_or(0),
+                    expires_at: msg.expires_at,
                     created_at: event_created_at,
                 };
                 match store.insert_message(&rec) {
@@ -975,6 +1048,111 @@ mod tests {
                 .status,
             "pending"
         );
+    }
+
+    #[tokio::test]
+    async fn publish_opts_not_before_sets_visible_at_and_is_not_immediately_claimable() {
+        let (nq, _) = setup();
+        let not_before = chrono::Utc::now().timestamp() + 3600;
+        let receipt = nq
+            .publish_opts(
+                "jobs.email",
+                json!({"n": 1}),
+                None,
+                PublishOptions {
+                    not_before: Some(not_before),
+                    expires_at: None,
+                },
+            )
+            .await
+            .unwrap();
+        let rec = nq.store().get_message(&receipt.mid).unwrap().unwrap();
+        assert_eq!(rec.visible_at, not_before);
+        assert!(nq
+            .store()
+            .claimable("jobs.email", chrono::Utc::now().timestamp(), 10)
+            .unwrap()
+            .is_empty());
+        assert!(!nq
+            .store()
+            .claimable("jobs.email", not_before, 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn default_publish_leaves_visible_at_and_expires_at_unset() {
+        let (nq, _) = setup();
+        let receipt = nq
+            .publish("jobs.email", json!({"n": 1}), None)
+            .await
+            .unwrap();
+        let rec = nq.store().get_message(&receipt.mid).unwrap().unwrap();
+        assert_eq!(rec.visible_at, 0);
+        assert_eq!(rec.expires_at, None);
+    }
+
+    #[tokio::test]
+    async fn try_claim_marks_already_expired_message_expired_and_returns_false() {
+        let (nq, _) = setup();
+        let past = chrono::Utc::now().timestamp() - 10;
+        let receipt = nq
+            .publish_opts(
+                "jobs.email",
+                json!({"n": 1}),
+                None,
+                PublishOptions {
+                    not_before: None,
+                    expires_at: Some(past),
+                },
+            )
+            .await
+            .unwrap();
+        let rec = nq.store().get_message(&receipt.mid).unwrap().unwrap();
+        assert!(!nq.try_claim(&rec, 60, 10).await.unwrap());
+        let after = nq.store().get_message(&receipt.mid).unwrap().unwrap();
+        assert_eq!(after.status, "expired");
+        let kinds: Vec<String> = nq
+            .store()
+            .trace(&receipt.trace_id)
+            .unwrap()
+            .iter()
+            .map(|l| l.kind.clone())
+            .collect();
+        assert_eq!(kinds, vec!["published", "expired"]);
+    }
+
+    #[tokio::test]
+    async fn sweep_expired_marks_never_claimed_due_messages() {
+        let (nq, _) = setup();
+        let past = chrono::Utc::now().timestamp() - 10;
+        let receipt = nq
+            .publish_opts(
+                "jobs.email",
+                json!({"n": 1}),
+                None,
+                PublishOptions {
+                    not_before: None,
+                    expires_at: Some(past),
+                },
+            )
+            .await
+            .unwrap();
+        let n = nq.sweep_expired("jobs.email").await.unwrap();
+        assert_eq!(n, 1);
+        let rec = nq.store().get_message(&receipt.mid).unwrap().unwrap();
+        assert_eq!(rec.status, "expired");
+        let kinds: Vec<String> = nq
+            .store()
+            .trace(&receipt.trace_id)
+            .unwrap()
+            .iter()
+            .map(|l| l.kind.clone())
+            .collect();
+        assert_eq!(kinds, vec!["published", "expired"]);
+
+        // idempotent: nothing left to sweep
+        assert_eq!(nq.sweep_expired("jobs.email").await.unwrap(), 0);
     }
 
     #[test]

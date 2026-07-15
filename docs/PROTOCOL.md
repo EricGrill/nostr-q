@@ -33,6 +33,8 @@ with the publishing consumer's/producer's keypair.
 | `trace` | trace id (ULID) |
 | `attempt` | delivery attempt number |
 | `idem` | optional idempotency key |
+| `nbf` | optional not-before, unix seconds — message is not claimable before this time (delayed delivery) |
+| `exp` | optional expiry, unix seconds (SRS §11.3 reserved tag) — message must not be claimed once this time has passed (TTL) |
 
 **Lifecycle events (kinds 4621-4624 — claim, ack, nack, dlq):**
 
@@ -181,6 +183,44 @@ never terminal on a node whose row has never been retried — it is treated
 as informational rather than authoritative. Implementations that want their
 dead-letter events to be reliably terminal for other Nostr-Q nodes must set
 the `attempt` tag.
+
+## Delayed delivery and TTL
+
+Message events (kind 4620) may carry two optional scheduling tags,
+`nbf` (not-before) and `exp` (expiry), both unix seconds:
+
+- **`nbf` — delayed delivery.** A message with an `nbf` tag is not
+  claimable until that time. Locally this is implemented by seeding the
+  message row's `visible_at` from `nbf` at publish/ingest time (the same
+  `visible_at` column that already defers retries after a nack); `claimable`
+  already filters on `visible_at <= now`, so no new claimability logic was
+  needed for this half. Set it via `NostrQ::publish_opts` (`PublishOptions
+  { not_before: Some(ts), .. }`) or `nostr-q pub <queue> <payload> --delay
+  <dur>` / `--not-before <rfc3339>` (mutually exclusive with each other).
+- **`exp` — TTL / expiry.** A message with an `exp` tag must never be
+  claimed once that time has passed, whether or not it was ever claimed
+  before. `claimable` excludes any row with `expires_at <= now`. Separately,
+  `Store::expire_due(queue, now)` finds `pending`/`claimed` rows past their
+  `expires_at`, moves them to a new terminal status, `'expired'`, and
+  returns their mids. `NostrQ::try_claim` calls this (via an internal
+  helper) before doing any relay I/O when the surveyed row is already past
+  its TTL, and `NostrQ::sweep_expired(queue)` — called once per poll cycle
+  by `run_worker` — sweeps the whole queue so a message that is *never*
+  claimed (idle queue, all workers busy) still expires on schedule instead
+  of sitting `pending` forever. Set it via `PublishOptions { expires_at:
+  Some(ts), .. }` or `nostr-q pub <queue> <payload> --ttl <dur>` /
+  `--expires <rfc3339>` (mutually exclusive with each other).
+
+**Expired messages go to `'expired'`, not the DLQ.** The dead-letter queue
+(`dlq`/`status = 'dead'`) represents *processing failures* — a handler that
+kept nacking until it exhausted its retry budget. Expiry is a scheduling
+outcome decided before any handler ever ran (or without one ever running at
+all), which is a different condition an operator needs to distinguish from
+"a handler kept failing." Expired messages are therefore a separate
+terminal status, visible in `QueueStats.expired` / `nostr-q inspect`
+(human output: `expired: N`), and are not requeued by `dlq retry` — there is
+currently no CLI verb to resurrect an expired message; republish a fresh
+one instead.
 
 ## Local state is per-node
 
