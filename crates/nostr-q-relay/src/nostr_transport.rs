@@ -45,11 +45,19 @@ impl Transport for NostrTransport {
         let mut notifications = self.client.notifications();
         let (tx, rx) = mpsc::channel(256);
         tokio::spawn(async move {
-            while let Ok(notification) = notifications.recv().await {
-                if let RelayPoolNotification::Event { event, .. } = notification {
-                    if filter.match_event(&event) && tx.send(*event).await.is_err() {
-                        break;
+            loop {
+                match notifications.recv().await {
+                    Ok(notification) => {
+                        if let RelayPoolNotification::Event { event, .. } = notification {
+                            if filter.match_event(&event) && tx.send(*event).await.is_err() {
+                                return;
+                            }
+                        }
                     }
+                    // Lagged skips missed notifications but the channel is still live —
+                    // keep forwarding rather than silently dropping the subscriber.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 }
             }
         });
