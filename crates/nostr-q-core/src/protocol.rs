@@ -165,9 +165,11 @@ pub fn build_dlq_event(
     queue: &str,
     mid: &str,
     trace_id: &str,
+    attempt: u32,
     reason: &str,
 ) -> Result<Event, ProtocolError> {
     let mut tags = lifecycle_tags(message_event_id, queue, mid, trace_id);
+    tags.push(custom_tag("attempt", attempt.to_string()));
     tags.push(custom_tag("reason", reason));
     sign(
         EventBuilder::new(Kind::Custom(KIND_DLQ), "").tags(tags),
@@ -343,5 +345,9 @@ mod tests {
         let nack = build_nack_event(&keys, msg_id, "jobs.email", "m1", "t1", 3, "boom").unwrap();
         assert_eq!(tag_value(&nack, "attempt").as_deref(), Some("3"));
         assert_eq!(tag_value(&nack, "reason").as_deref(), Some("boom"));
+        let dlq = build_dlq_event(&keys, msg_id, "jobs.email", "m1", "t1", 4, "dead").unwrap();
+        assert_eq!(dlq.kind.as_u16(), KIND_DLQ);
+        assert_eq!(tag_value(&dlq, "attempt").as_deref(), Some("4"));
+        assert_eq!(tag_value(&dlq, "reason").as_deref(), Some("dead"));
     }
 }
