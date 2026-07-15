@@ -142,6 +142,27 @@ impl NostrQ {
         let now = Self::now();
         let lease_expires_at = now + lease_seconds as i64;
         let message_event_id = EventId::from_hex(&rec.event_id)?;
+        let nack_filter = Filter::new()
+            .kind(Kind::Custom(KIND_NACK))
+            .event(message_event_id);
+
+        // Local attempt counters are per-worker: `rec.attempts` only advances
+        // when THIS worker nacks. If we tagged our claim with the local
+        // count alone, a worker that never nacked would keep publishing
+        // claims at attempt 0, which `claim_winner` permanently filters out
+        // once any other worker's nack has pushed the generation forward.
+        // Tag with the max of local and globally observed attempt instead,
+        // so a worker that never nacked can still reclaim after a foreign
+        // nack.
+        let observed_attempt = self
+            .transport
+            .query(nack_filter.clone())
+            .await?
+            .iter()
+            .map(event_attempt)
+            .max()
+            .unwrap_or(0);
+        let claim_attempt = rec.attempts.max(observed_attempt);
         let claim = build_claim_event(
             &self.keys,
             message_event_id,
@@ -149,7 +170,7 @@ impl NostrQ {
             &rec.mid,
             &rec.trace_id,
             lease_expires_at,
-            rec.attempts,
+            claim_attempt,
         )?;
         let our_claim_id = claim.id;
         self.transport.publish(claim).await?;
@@ -165,10 +186,11 @@ impl NostrQ {
             .iter()
             .filter_map(|e| parse_claim_event(e).ok())
             .collect();
-        let nack_filter = Filter::new()
-            .kind(Kind::Custom(KIND_NACK))
-            .event(message_event_id);
-        let min_attempt = self
+        // Re-query nacks post-settle: if a newer nack landed during the
+        // settle window, our claim is stale relative to the new generation
+        // and we correctly lose this round — the next poll retries with the
+        // higher observed attempt.
+        let post_settle_max_attempt = self
             .transport
             .query(nack_filter)
             .await?
@@ -176,6 +198,7 @@ impl NostrQ {
             .map(event_attempt)
             .max()
             .unwrap_or(0);
+        let min_attempt = observed_attempt.max(post_settle_max_attempt);
         let we_won = claim_winner(&claims, min_attempt, now)
             .map(|w| w.claim_event_id == our_claim_id)
             .unwrap_or(false);
@@ -532,6 +555,52 @@ mod tests {
             wins.iter().filter(|w| **w).count(),
             1,
             "exactly one worker must win the claim"
+        );
+    }
+
+    #[tokio::test]
+    async fn other_worker_can_reclaim_after_foreign_nack() {
+        let transport = Arc::new(MockTransport::new());
+        let mk = |t: Arc<MockTransport>| {
+            let store = Arc::new(Store::open_in_memory().unwrap());
+            store
+                .upsert_queue(&QueueConfig::work_queue("jobs.email"))
+                .unwrap();
+            NostrQ::new(Keys::generate(), store, t)
+        };
+        let producer = mk(transport.clone());
+        let w1 = mk(transport.clone());
+        let w2 = mk(transport.clone());
+        let _i1 = w1.spawn_ingest("jobs.email").await.unwrap();
+        let _i2 = w2.spawn_ingest("jobs.email").await.unwrap();
+        let receipt = producer
+            .publish("jobs.email", json!({"n": 1}), None)
+            .await
+            .unwrap();
+
+        for w in [&w1, &w2] {
+            for _ in 0..40 {
+                if w.store().get_message(&receipt.mid).unwrap().is_some() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+
+        // w1 claims and nacks; its local attempts becomes 1, w2's stays 0
+        let r1 = w1.store().get_message(&receipt.mid).unwrap().unwrap();
+        assert!(w1.try_claim(&r1, 60, 10).await.unwrap());
+        matches!(
+            w1.nack(&receipt.mid, "boom").await.unwrap(),
+            NackOutcome::Retry { .. }
+        );
+
+        // w2 never nacked (local attempts 0) but must still be able to reclaim
+        let r2 = w2.store().get_message(&receipt.mid).unwrap().unwrap();
+        assert_eq!(r2.attempts, 0);
+        assert!(
+            w2.try_claim(&r2, 60, 10).await.unwrap(),
+            "a worker that never nacked must not be locked out after a foreign nack"
         );
     }
 
