@@ -75,7 +75,18 @@ impl Transport for NostrTransport {
     async fn health(&self) -> Vec<RelayHealth> {
         let mut out = Vec::new();
         for (url, relay) in self.client.relays().await {
-            let connected = relay.status() == RelayStatus::Connected;
+            // `Client::connect()` kicks off the websocket handshake in the
+            // background and returns immediately, so a status read right
+            // after connect() races the handshake and reads it as `not
+            // connected` even when the relay is healthy. Give each relay a
+            // bounded window to finish the handshake before deciding it's
+            // down.
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut connected = relay.status() == RelayStatus::Connected;
+            while !connected && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                connected = relay.status() == RelayStatus::Connected;
+            }
             let latency_ms = if connected {
                 let start = Instant::now();
                 let probe = self
