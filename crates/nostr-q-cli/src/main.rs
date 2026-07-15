@@ -128,6 +128,23 @@ enum Cmd {
         #[arg(long)]
         token: Option<String>,
     },
+    /// Zero-dependency quickstart: an embedded relay + example queues, no
+    /// external relay needed. Runs until ctrl-c.
+    Dev {
+        /// Address to bind the embedded relay to (falls back to an
+        /// ephemeral port and reports it if this one is taken)
+        #[arg(long, default_value = "127.0.0.1:10547")]
+        addr: String,
+        /// Directory to hold the dev config/state/key (default: a
+        /// dev-labeled location under the config/data dirs, or
+        /// NQ_CONFIG/NQ_STATE if set)
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+        /// Also run a sample worker and publish one sample job so you see a
+        /// job flow (published -> claimed -> acked) immediately
+        #[arg(long)]
+        with_sample: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -300,5 +317,10 @@ async fn main() -> anyhow::Result<()> {
             let ctx = Ctx::load(cli.config, cli.json)?;
             commands::serve(&ctx, &addr, token).await
         }
+        Cmd::Dev {
+            addr,
+            dir,
+            with_sample,
+        } => commands::dev(&addr, dir, with_sample).await,
     }
 }

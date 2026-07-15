@@ -11,10 +11,12 @@ use axum::response::{IntoResponse, Json};
 use axum::routing::{get, post};
 use axum::Router;
 use nostr_q::queue::{Delivery, QueueConfig, QueueMode};
-use nostr_q::relay::{NostrTransport, RelayHealth, Transport};
+use nostr_q::relay::{serve_dev_relay, DevRelay, NostrTransport, RelayHealth, Transport};
 use nostr_q::store::{QueueStats, Store};
 use nostr_q::NostrQ;
-use nostr_q_worker::{handlers::ExecHandler, run_worker, Handler, WorkerOptions};
+use nostr_q_worker::{
+    handlers::ExecHandler, run_worker, Handler, HandlerOutcome, JobContext, WorkerOptions,
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -1101,9 +1103,328 @@ pub async fn serve(ctx: &Ctx, addr: &str, token: Option<String>) -> Result<()> {
     Ok(())
 }
 
+// --- `nostr-q dev` — zero-dependency quickstart with an embedded relay
+// (CHA-2343, SRS §13.3) ---
+//
+// Gets a newcomer to a working job flow in ~10 seconds with NO external
+// relay: starts an in-process NIP-01 relay (`nostr_q::relay::serve_dev_relay`),
+// provisions a disposable config/state/key under a dev-labeled directory,
+// registers the embedded relay, creates two example queues, and (with
+// `--with-sample`) runs a sample publish -> claim -> ack flow so the user
+// sees it work immediately.
+
+/// Resolved filesystem locations for a `nostr-q dev` environment. Always a
+/// flat, self-contained set of paths - a real `nostr-q dev`-created config
+/// never coexists in the same directory as a production one.
+struct DevPaths {
+    config_path: PathBuf,
+    state_path: PathBuf,
+    key_path: PathBuf,
+}
+
+/// Resolve where the dev environment's config/state/key live.
+///
+/// Precedence, highest first:
+/// 1. `--dir` (explicit, flat: `<dir>/{config.toml,state.db,key}`)
+/// 2. `NOSTR_Q_CONFIG`/`NQ_CONFIG` + `NOSTR_Q_STATE`/`NQ_STATE` (caller
+///    opted into specific paths - honor them exactly like every other
+///    command)
+/// 3. a dev-labeled default under the XDG config/data dirs, distinct from
+///    the regular `nostr-q init` location so `nostr-q dev` never collides
+///    with a user's real config.
+fn resolve_dev_paths(dir: Option<&std::path::Path>) -> DevPaths {
+    if let Some(dir) = dir {
+        return DevPaths {
+            config_path: dir.join("config.toml"),
+            state_path: dir.join("state.db"),
+            key_path: dir.join("key"),
+        };
+    }
+
+    let config_path =
+        if let Ok(p) = std::env::var("NOSTR_Q_CONFIG").or_else(|_| std::env::var("NQ_CONFIG")) {
+            PathBuf::from(p)
+        } else {
+            config::expand_tilde("~/.config/nostr-q/dev/config.toml")
+        };
+    let state_path =
+        if let Ok(p) = std::env::var("NOSTR_Q_STATE").or_else(|_| std::env::var("NQ_STATE")) {
+            config::expand_tilde(&p)
+        } else {
+            config::expand_tilde("~/.local/share/nostr-q/dev/state.db")
+        };
+    let key_path = config_path
+        .parent()
+        .map(|p| p.join("key"))
+        .unwrap_or_else(|| PathBuf::from("key"));
+
+    DevPaths {
+        config_path,
+        state_path,
+        key_path,
+    }
+}
+
+/// Sample handler for `nostr-q dev --with-sample`: prints the payload it
+/// receives so the flow is visibly published -> claimed -> acked in the
+/// terminal (an `ExecHandler`'s stdout/stderr are captured, not forwarded
+/// to the terminal, so a real in-process `Handler` is what actually makes
+/// the flow visible here).
+struct DevSampleHandler;
+
+#[async_trait::async_trait]
+impl Handler for DevSampleHandler {
+    async fn handle(&self, job: &JobContext) -> HandlerOutcome {
+        println!(
+            "[dev] worker claimed mid={} payload={}",
+            job.mid, job.payload
+        );
+        println!("[dev] worker acked mid={}", job.mid);
+        HandlerOutcome::Success { reply: None }
+    }
+}
+
+/// Start the sample worker on `jobs.email` and publish one sample job.
+/// Returns the worker's join handle so the caller can wait for it on
+/// shutdown.
+async fn spawn_sample_flow(
+    ctx: &Ctx,
+    shutdown: CancellationToken,
+) -> Result<tokio::task::JoinHandle<()>> {
+    let nq = Arc::new(ctx.connect().await?);
+    let opts = WorkerOptions {
+        concurrency: 1,
+        lease_seconds: 30,
+        heartbeat_seconds: 30,
+        settle_ms: 200,
+        poll_ms: 250,
+    };
+    let worker_nq = nq.clone();
+    let handle = tokio::spawn(async move {
+        if let Err(e) = run_worker(
+            worker_nq,
+            "jobs.email".to_string(),
+            Arc::new(DevSampleHandler),
+            opts,
+            shutdown,
+        )
+        .await
+        {
+            eprintln!("nostr-q dev: sample worker error: {e}");
+        }
+    });
+
+    // Give the worker a moment to start polling before publishing, so the
+    // sample job is claimed promptly rather than waiting out a full poll
+    // cycle.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    println!("[dev] publishing a sample job to 'jobs.email'...");
+    let receipt = nq
+        .publish(
+            "jobs.email",
+            serde_json::json!({"hello": "nostr-q", "from": "nostr-q dev --with-sample"}),
+            None,
+        )
+        .await?;
+    println!(
+        "[dev] published mid={} trace={}",
+        receipt.mid, receipt.trace_id
+    );
+    Ok(handle)
+}
+
+fn print_dev_ready(ctx: &Ctx, relay: &DevRelay, paths: &DevPaths) {
+    println!("nostr-q dev: environment ready\n");
+    println!("  relay:   {} (embedded, in-memory, dev-only)", relay.url());
+    println!("  config:  {}", paths.config_path.display());
+    println!("  state:   {}", ctx.config.state_path().display());
+    println!("  queues:  jobs.email (work_queue), events.demo (pubsub)\n");
+    println!("Point other terminals at this environment:");
+    println!("  export NQ_CONFIG={}\n", paths.config_path.display());
+    println!("Try it (in another terminal, after exporting NQ_CONFIG above):");
+    println!("  nostr-q pub jobs.email '{{\"hello\":\"world\"}}'");
+    println!("  nostr-q worker jobs.email --exec 'cat'");
+    println!("  nostr-q sub events.demo\n");
+    println!("Ctrl-C to stop the embedded relay.");
+}
+
+/// `nostr-q dev [--addr 127.0.0.1:10547] [--dir <path>] [--with-sample]` —
+/// zero-dependency quickstart (CHA-2343). Starts an embedded NIP-01 relay,
+/// provisions a disposable dev config/state/key, registers the relay,
+/// creates two example queues, and (optionally) runs a sample job flow.
+/// Runs until ctrl-c, then shuts the relay (and any sample worker) down.
+pub async fn dev(addr: &str, dir: Option<PathBuf>, with_sample: bool) -> Result<()> {
+    let paths = resolve_dev_paths(dir.as_deref());
+    if let Some(parent) = paths.config_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating dev config dir {}", parent.display()))?;
+    }
+    if let Some(parent) = paths.state_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating dev state dir {}", parent.display()))?;
+    }
+
+    let cfg = if paths.config_path.exists() {
+        Config::load(&paths.config_path)?
+    } else {
+        let cfg = Config {
+            state: paths.state_path.display().to_string(),
+            key_file: paths.key_path.display().to_string(),
+        };
+        cfg.save(&paths.config_path)?;
+        cfg
+    };
+    let store = Arc::new(Store::open(&cfg.state_path())?);
+    let ctx = Ctx {
+        config: cfg,
+        store,
+        json: false,
+    };
+
+    if !ctx.config.key_path().exists() {
+        key_generate(&ctx)?;
+    }
+
+    let requested_addr: SocketAddr = addr
+        .parse()
+        .with_context(|| format!("invalid --addr '{addr}' — expected host:port"))?;
+    let relay = match serve_dev_relay(requested_addr).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "nostr-q dev: could not bind {addr} ({e}) — falling back to an ephemeral port"
+            );
+            serve_dev_relay("127.0.0.1:0".parse().unwrap())
+                .await
+                .context("failed to start the embedded dev relay")?
+        }
+    };
+    let relay_url = relay.url();
+    if !ctx.store.list_relays()?.iter().any(|u| u == &relay_url) {
+        ctx.store.add_relay(&relay_url)?;
+    }
+
+    queue_create(&ctx, "jobs.email", "work_queue", None, None, None)?;
+    queue_create(&ctx, "events.demo", "pubsub", None, None, None)?;
+
+    print_dev_ready(&ctx, &relay, &paths);
+
+    let shutdown = CancellationToken::new();
+    let sample_worker = if with_sample {
+        Some(spawn_sample_flow(&ctx, shutdown.clone()).await?)
+    } else {
+        None
+    };
+
+    let sd = shutdown.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        sd.cancel();
+    });
+    shutdown.cancelled().await;
+
+    if let Some(handle) = sample_worker {
+        let _ = handle.await;
+    }
+    relay.shutdown().await;
+    println!("\nnostr-q dev: stopped. Goodbye!");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- `nostr-q dev` — zero-dependency quickstart (CHA-2343) ---
+
+    #[test]
+    fn resolve_dev_paths_with_dir_is_flat_and_self_contained() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = resolve_dev_paths(Some(dir.path()));
+        assert_eq!(paths.config_path, dir.path().join("config.toml"));
+        assert_eq!(paths.state_path, dir.path().join("state.db"));
+        assert_eq!(paths.key_path, dir.path().join("key"));
+    }
+
+    #[test]
+    fn resolve_dev_paths_without_dir_is_labeled_dev_and_distinct_from_init_default() {
+        // Only meaningful when NQ_CONFIG/NQ_STATE aren't set in the test
+        // environment - matches the existing `default_config_path_is_xdg_style`
+        // convention for env-dependent path tests.
+        let paths = resolve_dev_paths(None);
+        assert_ne!(
+            paths.config_path,
+            config::default_config_path(),
+            "nostr-q dev must never default to the same config path as `nostr-q init`"
+        );
+        assert!(
+            paths
+                .config_path
+                .to_string_lossy()
+                .contains("nostr-q/dev/config.toml")
+                || std::env::var("NOSTR_Q_CONFIG").is_ok()
+                || std::env::var("NQ_CONFIG").is_ok(),
+            "{:?}",
+            paths.config_path
+        );
+    }
+
+    /// Smoke test for the `dev` command's setup wiring (config/state/key
+    /// provisioning, relay registration, example queue creation) with an
+    /// isolated `--dir` and an ephemeral relay port. The full run-until-ctrl-c
+    /// loop isn't exercised here (ctrl-c can't be simulated in-process); this
+    /// polls for the setup side effects to land, then aborts the task -
+    /// acceptable per CHA-2343's scope (manual smoke covers the full
+    /// lifecycle including graceful shutdown).
+    #[tokio::test]
+    async fn dev_with_dir_provisions_config_state_key_relay_and_queues() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_path_buf();
+        let handle = tokio::spawn(dev("127.0.0.1:0", Some(dir_path.clone()), false));
+
+        let config_path = dir_path.join("config.toml");
+        for _ in 0..100 {
+            if config_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(config_path.exists(), "dev must write config.toml");
+        assert!(
+            dir_path.join("key").exists(),
+            "dev must generate a key file"
+        );
+        assert!(
+            dir_path.join("state.db").exists(),
+            "dev must create the state db"
+        );
+
+        let cfg = Config::load(&config_path).unwrap();
+        let store = Store::open(&cfg.state_path()).unwrap();
+        let mut ready = false;
+        for _ in 0..100 {
+            let has_jobs = store.get_queue("jobs.email").unwrap().is_some();
+            let has_events = store.get_queue("events.demo").unwrap().is_some();
+            let has_relay = !store.list_relays().unwrap().is_empty();
+            if has_jobs && has_events && has_relay {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            ready,
+            "dev must create jobs.email + events.demo and register the embedded relay"
+        );
+
+        let relays = store.list_relays().unwrap();
+        assert!(
+            relays.iter().all(|u| u.starts_with("ws://127.0.0.1:")),
+            "the registered relay must be the embedded dev relay: {relays:?}"
+        );
+
+        handle.abort();
+    }
 
     fn test_ctx(key_file: PathBuf) -> Ctx {
         let store = Arc::new(Store::open_in_memory().unwrap());
