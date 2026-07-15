@@ -31,6 +31,22 @@ enum Cmd {
         #[command(subcommand)]
         cmd: RelayCmd,
     },
+    /// Queue/topic management
+    Queue {
+        #[command(subcommand)]
+        cmd: QueueCmd,
+    },
+    /// Publish a JSON message to a queue or topic
+    Pub {
+        queue: String,
+        /// JSON payload (reads stdin when omitted)
+        payload: Option<String>,
+        /// Idempotency key (duplicate keys on a queue are dropped)
+        #[arg(long)]
+        idem: Option<String>,
+    },
+    /// Subscribe to a pub/sub topic and print events
+    Sub { topic: String },
 }
 
 #[derive(Subcommand)]
@@ -51,6 +67,27 @@ enum RelayCmd {
     Remove { url: String },
     /// Check connectivity and latency of configured relays
     Health,
+}
+
+#[derive(Subcommand)]
+enum QueueCmd {
+    /// Create or update a queue/topic
+    Create {
+        name: String,
+        /// work_queue | pubsub
+        #[arg(long)]
+        mode: String,
+        /// best_effort | at_most_once | at_least_once
+        #[arg(long)]
+        delivery: Option<String>,
+        #[arg(long)]
+        max_attempts: Option<u32>,
+        /// Lease seconds for claims
+        #[arg(long)]
+        lease: Option<u64>,
+    },
+    /// List queues/topics
+    List,
 }
 
 #[tokio::main]
@@ -77,6 +114,23 @@ async fn main() -> anyhow::Result<()> {
                 RelayCmd::Remove { url } => commands::relay_remove(&ctx, &url),
                 RelayCmd::Health => commands::relay_health(&ctx).await,
             }
+        }
+        Cmd::Queue { cmd } => {
+            let ctx = Ctx::load(cli.config, cli.json)?;
+            match cmd {
+                QueueCmd::Create { name, mode, delivery, max_attempts, lease } => {
+                    commands::queue_create(&ctx, &name, &mode, delivery, max_attempts, lease)
+                }
+                QueueCmd::List => commands::queue_list(&ctx),
+            }
+        }
+        Cmd::Pub { queue, payload, idem } => {
+            let ctx = Ctx::load(cli.config, cli.json)?;
+            commands::publish(&ctx, &queue, payload, idem).await
+        }
+        Cmd::Sub { topic } => {
+            let ctx = Ctx::load(cli.config, cli.json)?;
+            commands::subscribe_cmd(&ctx, &topic).await
         }
     }
 }

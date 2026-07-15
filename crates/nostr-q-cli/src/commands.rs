@@ -1,10 +1,13 @@
+use std::io::Read;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use nostr_q::relay::{NostrTransport, Transport};
 use nostr_q::store_crate::Store;
 use nostr_q::NostrQ;
+use nostr_q::queue::{Delivery, QueueConfig, QueueMode};
 
 use crate::config::{self, Config};
 
@@ -24,8 +27,6 @@ impl Ctx {
         Ok(Self { config: cfg, store, json })
     }
 
-    // Used by later CLI tasks (queue/relay/publish/subscribe commands).
-    #[allow(dead_code)]
     pub async fn connect(&self) -> Result<NostrQ> {
         let keys = config::load_keys(&self.config)?;
         let relays = self.store.list_relays()?;
@@ -122,6 +123,96 @@ pub async fn relay_health(ctx: &Ctx) -> Result<()> {
                 .unwrap_or_else(|| "-".into());
             let status = if h.connected { "connected" } else { "DOWN" };
             println!("{:<40} {:<10} {}", h.url, status, latency);
+        }
+    }
+    Ok(())
+}
+
+pub fn queue_create(
+    ctx: &Ctx,
+    name: &str,
+    mode: &str,
+    delivery: Option<String>,
+    max_attempts: Option<u32>,
+    lease: Option<u64>,
+) -> Result<()> {
+    let mode = QueueMode::from_str(mode).map_err(anyhow::Error::msg)?;
+    let mut q = match mode {
+        QueueMode::WorkQueue => QueueConfig::work_queue(name),
+        QueueMode::Pubsub => QueueConfig::pubsub(name),
+    };
+    if let Some(d) = delivery {
+        q.delivery = Delivery::from_str(&d).map_err(anyhow::Error::msg)?;
+    }
+    if let Some(m) = max_attempts {
+        q.max_attempts = m;
+    }
+    if let Some(l) = lease {
+        q.lease_seconds = l;
+    }
+    ctx.store.upsert_queue(&q)?;
+    println!("created queue '{}' mode={} delivery={}", q.name, q.mode.as_str(), q.delivery.as_str());
+    Ok(())
+}
+
+pub fn queue_list(ctx: &Ctx) -> Result<()> {
+    let queues = ctx.store.list_queues()?;
+    if ctx.json {
+        println!("{}", serde_json::to_string(&queues)?);
+    } else if queues.is_empty() {
+        println!("no queues — create one with `nq queue create <name> --mode work_queue`");
+    } else {
+        for q in queues {
+            println!(
+                "{:<30} {:<11} {:<14} max_attempts={} lease={}s",
+                q.name, q.mode.as_str(), q.delivery.as_str(), q.max_attempts, q.lease_seconds
+            );
+        }
+    }
+    Ok(())
+}
+
+pub async fn publish(
+    ctx: &Ctx,
+    queue: &str,
+    payload: Option<String>,
+    idem: Option<String>,
+) -> Result<()> {
+    let raw = match payload {
+        Some(p) => p,
+        None => {
+            let mut s = String::new();
+            std::io::stdin().read_to_string(&mut s)?;
+            s
+        }
+    };
+    let body: serde_json::Value =
+        serde_json::from_str(&raw).context("payload must be valid JSON")?;
+    let nq = ctx.connect().await?;
+    let receipt = nq.publish(queue, body, idem).await?;
+    if ctx.json {
+        println!("{}", serde_json::to_string(&receipt)?);
+    } else {
+        println!("published mid={} trace={} event={}", receipt.mid, receipt.trace_id, receipt.event_id);
+    }
+    Ok(())
+}
+
+pub async fn subscribe_cmd(ctx: &Ctx, topic: &str) -> Result<()> {
+    let nq = ctx.connect().await?;
+    let mut rx = nq.subscribe(topic).await?;
+    eprintln!("subscribed to '{topic}' — ctrl-c to stop");
+    while let Some(msg) = rx.recv().await {
+        if ctx.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "mid": msg.mid, "queue": msg.queue, "trace": msg.trace_id,
+                    "attempt": msg.attempt, "body": msg.envelope.body
+                })
+            );
+        } else {
+            println!("[{}] mid={} {}", msg.queue, msg.mid, msg.envelope.body);
         }
     }
     Ok(())
