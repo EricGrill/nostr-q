@@ -37,7 +37,8 @@ CREATE TABLE IF NOT EXISTS messages (
   visible_at INTEGER NOT NULL DEFAULT 0,
   expires_at INTEGER,
   created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
+  updated_at INTEGER NOT NULL,
+  reply_to TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_idem
   ON messages(queue, idem_key) WHERE idem_key IS NOT NULL;
@@ -75,6 +76,11 @@ pub struct MessageRecord {
     pub visible_at: i64,
     pub expires_at: Option<i64>,
     pub created_at: i64,
+    /// Requester pubkey hex if this message is an RPC request (mirrors
+    /// `NqMessage::reply_to`); `None` for ordinary jobs. Persisted here so a
+    /// worker can gate reply publishing locally instead of issuing a
+    /// transport query on every successful job (CHA-2348).
+    pub reply_to: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -105,7 +111,7 @@ pub struct QueueStats {
     pub oldest_pending_age_secs: Option<i64>,
 }
 
-const MSG_COLS: &str = "mid, queue, event_id, trace_id, envelope_json, status, attempts, attempt_floor, idem_key, visible_at, expires_at, created_at";
+const MSG_COLS: &str = "mid, queue, event_id, trace_id, envelope_json, status, attempts, attempt_floor, idem_key, visible_at, expires_at, created_at, reply_to";
 
 fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRecord> {
     Ok(MessageRecord {
@@ -121,6 +127,7 @@ fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRecord> {
         visible_at: row.get(9)?,
         expires_at: row.get(10)?,
         created_at: row.get(11)?,
+        reply_to: row.get(12)?,
     })
 }
 
@@ -248,12 +255,12 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
             "INSERT OR IGNORE INTO messages
-               (mid, queue, event_id, trace_id, envelope_json, status, attempts, attempt_floor, idem_key, visible_at, expires_at, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+               (mid, queue, event_id, trace_id, envelope_json, status, attempts, attempt_floor, idem_key, visible_at, expires_at, created_at, updated_at, reply_to)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             rusqlite::params![
                 rec.mid, rec.queue, rec.event_id, rec.trace_id, rec.envelope_json,
                 rec.status, rec.attempts, rec.attempt_floor, rec.idem_key, rec.visible_at,
-                rec.expires_at, rec.created_at, Self::now()
+                rec.expires_at, rec.created_at, Self::now(), rec.reply_to
             ],
         )?;
         Ok(n == 1)
@@ -628,6 +635,7 @@ mod tests {
             visible_at: 0,
             expires_at: None,
             created_at: 100,
+            reply_to: None,
         }
     }
 

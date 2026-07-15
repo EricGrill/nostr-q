@@ -34,6 +34,11 @@ pub struct JobContext {
     /// event's `e` tag) when the handler returns `Success { reply: Some }`
     /// for an RPC request.
     pub event_id: String,
+    /// Requester pubkey hex if this job is an RPC request (mirrors
+    /// `MessageRecord::reply_to`); `None` for ordinary jobs. `run_worker`
+    /// gates reply publishing on this being `Some` instead of issuing a
+    /// transport query on every successful job (CHA-2348).
+    pub reply_to: Option<String>,
 }
 
 impl JobContext {
@@ -50,6 +55,7 @@ impl JobContext {
             idem: rec.idem_key.clone(),
             payload,
             event_id: rec.event_id.clone(),
+            reply_to: rec.reply_to.clone(),
         }
     }
 }
@@ -82,13 +88,21 @@ pub struct WorkerOptions {
 
 /// After a successful handler run that produced a reply body, publish a
 /// `KIND_REPLY` correlated to the request — but only if the request was
-/// actually an RPC request (carried a `reply` tag). `MessageRecord` doesn't
-/// persist `reply_to` itself, so this looks it up via `request_reply_to`,
-/// which re-fetches the original request event by id. Failures here (bad
-/// event id, no responder pubkey, transport error) are logged and
-/// swallowed — the job WAS processed correctly, so the caller must still
-/// ack it even if the reply couldn't be delivered.
+/// actually an RPC request (`job.reply_to` set, carried straight from the
+/// stored `MessageRecord`). This is a pure local decision: no transport
+/// query is needed, because `reply_to` is persisted on the row at publish
+/// (`NostrQ::call`) or ingest (`NostrQ::spawn_ingest`) time (CHA-2348) — an
+/// ordinary non-RPC job (`reply_to: None`) never triggers this even if its
+/// handler happened to emit a reply body. Failures here (bad event id,
+/// transport error) are logged and swallowed — the job WAS processed
+/// correctly, so the caller must still ack it even if the reply couldn't be
+/// delivered.
 async fn publish_rpc_reply_if_requested(nq: &NostrQ, job: &JobContext, body: serde_json::Value) {
+    let Some(requester) = job.reply_to.as_deref() else {
+        // Not an RPC request (no reply_to) — the handler returned a reply
+        // body anyway, which is fine; there's just nowhere to send it.
+        return;
+    };
     let request_event_id = match EventId::from_hex(&job.event_id) {
         Ok(id) => id,
         Err(e) => {
@@ -96,23 +110,11 @@ async fn publish_rpc_reply_if_requested(nq: &NostrQ, job: &JobContext, body: ser
             return;
         }
     };
-    match nq.request_reply_to(request_event_id).await {
-        Ok(Some(requester)) => {
-            if let Err(e) = nq
-                .publish_reply(&requester, request_event_id, &job.mid, body)
-                .await
-            {
-                tracing::warn!(mid = %job.mid, error = %e, "failed to publish rpc reply");
-            }
-        }
-        Ok(None) => {
-            // Not an RPC request (no `reply` tag) — the handler returned a
-            // reply body anyway, which is fine; there's just nowhere to
-            // send it.
-        }
-        Err(e) => {
-            tracing::warn!(mid = %job.mid, error = %e, "failed to look up rpc requester");
-        }
+    if let Err(e) = nq
+        .publish_reply(requester, request_event_id, &job.mid, body)
+        .await
+    {
+        tracing::warn!(mid = %job.mid, error = %e, "failed to publish rpc reply");
     }
 }
 
@@ -303,7 +305,7 @@ mod tests {
 
     use nostr::Keys;
     use nostr_q::queue::QueueConfig;
-    use nostr_q::relay::MockTransport;
+    use nostr_q::relay::{MockTransport, Transport};
     use nostr_q::store::Store;
     use nostr_q::NostrQ;
     use serde_json::json;
@@ -331,6 +333,7 @@ mod tests {
             idem: Some("i1".into()),
             payload: json!({"n": 1}),
             event_id: "e1".into(),
+            reply_to: None,
         }
     }
 
@@ -915,6 +918,131 @@ mod tests {
         assert!(
             acked,
             "a reply body on a non-RPC message must not block the ack"
+        );
+    }
+
+    /// CHA-2348: the whole point of gating on the stored `reply_to` is that
+    /// a non-RPC job whose handler happens to emit JSON on stdout must never
+    /// trigger a reply publish (previously this was decided via a transport
+    /// query — `request_reply_to` — on every successful job). Prove the
+    /// negative directly against the transport's own event log, and prove
+    /// the positive (an actual RPC job does get a `KIND_REPLY` published)
+    /// on the same shared transport for contrast.
+    #[tokio::test]
+    async fn non_rpc_job_never_publishes_reply_even_when_handler_emits_json() {
+        use nostr_q::protocol::KIND_REPLY;
+
+        let transport = Arc::new(MockTransport::new());
+        let mk = |t: Arc<MockTransport>| {
+            let store = Arc::new(Store::open_in_memory().unwrap());
+            store
+                .upsert_queue(&QueueConfig::work_queue("jobs.email"))
+                .unwrap();
+            store
+                .upsert_queue(&QueueConfig::work_queue("rpc.echo"))
+                .unwrap();
+            Arc::new(NostrQ::new(Keys::generate(), store, t))
+        };
+        let non_rpc_producer = mk(transport.clone());
+        let non_rpc_worker_nq = mk(transport.clone());
+        let caller = mk(transport.clone());
+        let rpc_worker_nq = mk(transport.clone());
+
+        // A plain (non-RPC) publish whose handler emits a JSON reply body.
+        let receipt = non_rpc_producer
+            .publish("jobs.email", json!({"n": 1}), None)
+            .await
+            .unwrap();
+
+        struct JsonEmittingHandler;
+        #[async_trait::async_trait]
+        impl Handler for JsonEmittingHandler {
+            async fn handle(&self, _job: &JobContext) -> HandlerOutcome {
+                HandlerOutcome::Success {
+                    reply: Some(json!({"result": 42})),
+                }
+            }
+        }
+
+        let shutdown = CancellationToken::new();
+        let opts = WorkerOptions {
+            concurrency: 1,
+            lease_seconds: 60,
+            heartbeat_seconds: 3600,
+            settle_ms: 10,
+            poll_ms: 50,
+        };
+        let handle = tokio::spawn(run_worker(
+            non_rpc_worker_nq.clone(),
+            "jobs.email".into(),
+            Arc::new(JsonEmittingHandler),
+            opts.clone(),
+            shutdown.clone(),
+        ));
+
+        let mut acked = false;
+        for _ in 0..100 {
+            let status = non_rpc_worker_nq
+                .store()
+                .get_message(&receipt.mid)
+                .unwrap()
+                .map(|r| r.status);
+            if status.as_deref() == Some("acked") {
+                acked = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        shutdown.cancel();
+        handle.await.unwrap().unwrap();
+        assert!(acked, "non-RPC job must still be acked");
+
+        let replies_after_non_rpc = transport
+            .query(nostr::Filter::new().kind(nostr::Kind::Custom(KIND_REPLY)))
+            .await
+            .unwrap();
+        assert_eq!(
+            replies_after_non_rpc.len(),
+            0,
+            "a non-RPC job's JSON reply body must never publish a KIND_REPLY event"
+        );
+
+        // Now drive a real RPC job on the same shared transport and confirm
+        // it DOES get a reply published — proving the gate lets the actual
+        // RPC path through rather than silently breaking it.
+        let shutdown2 = CancellationToken::new();
+        let handle2 = tokio::spawn(run_worker(
+            rpc_worker_nq.clone(),
+            "rpc.echo".into(),
+            Arc::new(crate::handlers::ExecHandler {
+                command: "cat".into(),
+            }),
+            opts,
+            shutdown2.clone(),
+        ));
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            caller.call(
+                "rpc.echo",
+                json!({"n": 7}),
+                std::time::Duration::from_secs(5),
+            ),
+        )
+        .await
+        .expect("call should not hang")
+        .expect("rpc call should receive a reply");
+        shutdown2.cancel();
+        handle2.await.unwrap().unwrap();
+        assert_eq!(reply, json!({"n": 7}));
+
+        let replies_after_rpc = transport
+            .query(nostr::Filter::new().kind(nostr::Kind::Custom(KIND_REPLY)))
+            .await
+            .unwrap();
+        assert_eq!(
+            replies_after_rpc.len(),
+            1,
+            "an actual RPC job must publish exactly one KIND_REPLY event"
         );
     }
 }
