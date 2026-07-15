@@ -127,4 +127,24 @@ mod tests {
         assert!(QueueMode::from_str("bogus").is_err());
         assert_eq!(QueueMode::WorkQueue.as_str(), "work_queue");
     }
+
+    #[test]
+    fn serde_snake_case_roundtrip() {
+        let q = QueueConfig::work_queue("jobs.email");
+        let json = serde_json::to_string(&q).unwrap();
+        assert!(json.contains("\"mode\":\"work_queue\""), "{json}");
+        assert!(json.contains("\"delivery\":\"at_least_once\""), "{json}");
+        assert!(json.contains("\"encryption\":\"none\""), "{json}");
+        let back: QueueConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, q);
+        // encryption/max_attempts/lease/retry_base may be omitted and default
+        let sparse: QueueConfig = serde_json::from_str(
+            r#"{"name":"x","mode":"pubsub","delivery":"best_effort"}"#,
+        )
+        .unwrap();
+        assert_eq!(sparse.encryption, Encryption::None);
+        assert_eq!(sparse.max_attempts, 5);
+        assert_eq!(sparse.lease_seconds, 60);
+        assert_eq!(sparse.retry_base_seconds, 5);
+    }
 }
