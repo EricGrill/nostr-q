@@ -825,6 +825,19 @@ dependencies = [
 [[package]]
 name = "nostr-q"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "nostr",
+ "nostr-q-core",
+ "nostr-q-relay",
+ "nostr-q-store",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "nostr-q-core"
