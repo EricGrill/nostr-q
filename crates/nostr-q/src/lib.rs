@@ -113,6 +113,7 @@ impl NostrQ {
             envelope_json: msg.envelope.to_json()?,
             status: status.to_string(),
             attempts: 0,
+            attempt_floor: 0,
             idem_key: idem,
             visible_at: 0,
             created_at: Self::now(),
@@ -251,7 +252,13 @@ impl NostrQ {
         self.store
             .record_lifecycle(mid, &rec.trace_id, "nacked", reason)?;
 
-        if attempts >= config.max_attempts {
+        // `attempts` is the global retry generation and stays monotonic
+        // across a DLQ retry (see `Store::dlq_retry`), so the DLQ budget is
+        // measured relative to `rec.attempt_floor` — the generation at which
+        // the last retry granted a fresh budget — rather than against the
+        // raw counter.
+        let attempts_since_floor = attempts.saturating_sub(rec.attempt_floor);
+        if attempts_since_floor >= config.max_attempts {
             let dlq =
                 build_dlq_event(&self.keys, event_id, &rec.queue, mid, &rec.trace_id, reason)?;
             self.transport.publish(dlq).await?;
@@ -260,7 +267,8 @@ impl NostrQ {
                 .record_lifecycle(mid, &rec.trace_id, "dead_lettered", reason)?;
             Ok(NackOutcome::DeadLettered)
         } else {
-            let visible_at = Self::now() + backoff_secs(config.retry_base_seconds, attempts) as i64;
+            let visible_at =
+                Self::now() + backoff_secs(config.retry_base_seconds, attempts_since_floor) as i64;
             self.store.mark_pending(mid, visible_at)?;
             self.store.record_lifecycle(
                 mid,
@@ -325,6 +333,7 @@ impl NostrQ {
                     envelope_json: msg.envelope.to_json().unwrap_or_else(|_| "{}".into()),
                     status: "pending".to_string(),
                     attempts: msg.attempt,
+                    attempt_floor: 0,
                     idem_key: msg.idem.clone(),
                     visible_at: 0,
                     created_at: event.created_at.as_u64() as i64,
@@ -740,5 +749,41 @@ mod tests {
         assert_eq!(backoff_secs(5, 2), 10);
         assert_eq!(backoff_secs(5, 3), 20);
         assert_eq!(backoff_secs(5, 30), 3600); // capped
+    }
+
+    #[tokio::test]
+    async fn dlq_retry_grants_fresh_attempt_budget() {
+        let (nq, _) = setup();
+        let mut q = nq.store().get_queue("jobs.email").unwrap().unwrap();
+        q.max_attempts = 2;
+        nq.store().upsert_queue(&q).unwrap();
+        let receipt = nq
+            .publish("jobs.email", json!({"n": 1}), None)
+            .await
+            .unwrap();
+
+        // drive to DLQ: two failures
+        nq.nack(&receipt.mid, "f1").await.unwrap();
+        assert_eq!(
+            nq.nack(&receipt.mid, "f2").await.unwrap(),
+            NackOutcome::DeadLettered
+        );
+
+        // operator retries: fresh budget of 2 despite historical nacks on the relay
+        nq.store().dlq_retry(&receipt.mid).unwrap();
+        let rec = nq.store().get_message(&receipt.mid).unwrap().unwrap();
+        assert!(
+            nq.try_claim(&rec, 60, 10).await.unwrap(),
+            "post-retry claim must win"
+        );
+        match nq.nack(&receipt.mid, "f3").await.unwrap() {
+            NackOutcome::Retry { .. } => {}
+            other => panic!("first post-retry failure must be Retry, got {other:?}"),
+        }
+        assert_eq!(
+            nq.nack(&receipt.mid, "f4").await.unwrap(),
+            NackOutcome::DeadLettered,
+            "budget exhausts after max_attempts relative failures"
+        );
     }
 }
