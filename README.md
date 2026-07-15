@@ -1,7 +1,7 @@
 # Nostr-Q
 
 Nostr-Q turns ordinary Nostr relays into signed message queues, work queues,
-and pub/sub topics. It ships as a Rust SDK plus the `nq` CLI, with local
+and pub/sub topics. It ships as a Rust SDK plus the `nostr-q` CLI, with local
 SQLite state for claims, retries, traces, and dead-letter records.
 
 It is useful when you want lightweight queue coordination without running a
@@ -20,27 +20,27 @@ Nostr-Q is pre-1.0 and moving fast. The current MVP includes:
 - A SQLite local store for relays, queues, message state, traces, and DLQ
   records.
 - A `nostr_q` SDK facade for embedding queue behavior in Rust apps.
-- An `nq` CLI for setup, relay management, queue operations, workers,
+- An `nostr-q` CLI for setup, relay management, queue operations, workers,
   inspection, tracing, and DLQ retry.
 
 Read the protocol details in [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
 ## Install
 
-The public command is `nq`, provided by the `nq` package
+The public command is `nostr-q`, provided by the `nostr-q-cli` package
 (`crates/nostr-q-cli`).
 
 ### From Source
 
 ```sh
 cargo install --path crates/nostr-q-cli
-nq --help
+nostr-q --help
 ```
 
 Or run without installing:
 
 ```sh
-cargo run -p nq -- --help
+cargo run -p nostr-q-cli -- --help
 ```
 
 There is no published release yet (no Homebrew tap, no installer script, no
@@ -81,21 +81,21 @@ above) at `ws://localhost:10547`.
 export NQ_CONFIG=/tmp/nqdemo/config.toml
 export NQ_STATE=/tmp/nqdemo/state.db
 
-nq init
-nq key generate
-nq relay add ws://localhost:10547
-nq relay health
+nostr-q init
+nostr-q key generate
+nostr-q relay add ws://localhost:10547
+nostr-q relay health
 ```
 
 ```sh
-nq queue create jobs.email --mode work_queue --delivery at_least_once
+nostr-q queue create jobs.email --mode work_queue --delivery at_least_once
 ```
 
 Publish a message and run a worker to process it:
 
 ```sh
-nq pub jobs.email '{"to":"user@example.com","template":"welcome"}'
-nq worker jobs.email --exec 'cat > /dev/null'
+nostr-q pub jobs.email '{"to":"user@example.com","template":"welcome"}'
+nostr-q worker jobs.email --exec 'cat > /dev/null'
 ```
 
 The worker claims the message, runs the handler (here, a no-op that just
@@ -105,28 +105,28 @@ processed the message — it shuts down gracefully.
 Inspect what happened:
 
 ```sh
-nq inspect jobs.email
-nq trace <trace-id>
-nq dlq list
+nostr-q inspect jobs.email
+nostr-q trace <trace-id>
+nostr-q dlq list
 ```
 
-`nq inspect jobs.email` should show `acked: 1` once the worker has
+`nostr-q inspect jobs.email` should show `acked: 1` once the worker has
 processed the message above.
 
 ## CLI
 
 ```text
-nq init
-nq key generate|show
-nq relay add|list|remove|health
-nq queue create|list
-nq pub <queue-or-topic> <json>
-nq sub <topic>
-nq worker <queue> --exec <cmd>
-nq worker <queue> --http <url>
-nq inspect <queue>
-nq trace <trace-id-or-message-id>
-nq dlq list|retry
+nostr-q init
+nostr-q key generate|show
+nostr-q relay add|list|remove|health
+nostr-q queue create|list
+nostr-q pub <queue-or-topic> <json>
+nostr-q sub <topic>
+nostr-q worker <queue> --exec <cmd>
+nostr-q worker <queue> --http <url>
+nostr-q inspect <queue>
+nostr-q trace <trace-id-or-message-id>
+nostr-q dlq list|retry
 ```
 
 ## Guarantees
@@ -188,7 +188,7 @@ crates/
   nostr-q-relay/   Transport trait, mock transport, and nostr-sdk transport
   nostr-q/         SDK facade
   nostr-q-worker/  Worker runtime
-  nostr-q-cli/     CLI package (crate name `nq`), installed as `nq`
+  nostr-q-cli/     CLI package (crate `nostr-q-cli`), installed as `nostr-q`
 docs/
   PROTOCOL.md      Event kinds, tags, envelopes, and delivery semantics
 ```
