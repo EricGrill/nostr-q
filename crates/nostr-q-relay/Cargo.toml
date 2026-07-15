@@ -5,3 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+serde.workspace = true
+nostr.workspace = true
+nostr-sdk.workspace = true
+nostr-q-core.workspace = true
+tracing.workspace = true
