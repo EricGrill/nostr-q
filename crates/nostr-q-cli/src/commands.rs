@@ -280,3 +280,74 @@ pub async fn subscribe_cmd(ctx: &Ctx, topic: &str) -> Result<()> {
     }
     Ok(())
 }
+
+pub fn inspect(ctx: &Ctx, queue: &str) -> Result<()> {
+    anyhow::ensure!(
+        ctx.store.get_queue(queue)?.is_some(),
+        "unknown queue '{queue}'"
+    );
+    let now = chrono::Utc::now().timestamp();
+    let stats = ctx.store.stats(queue, now)?;
+    if ctx.json {
+        println!("{}", serde_json::to_string(&stats)?);
+    } else {
+        println!("queue:            {queue}");
+        println!("pending:          {}", stats.pending);
+        println!("in-flight:        {}", stats.in_flight);
+        println!("acked:            {}", stats.acked);
+        println!("dead-lettered:    {}", stats.dead);
+        match stats.oldest_pending_age_secs {
+            Some(age) => println!("oldest pending:   {age}s"),
+            None => println!("oldest pending:   -"),
+        }
+    }
+    Ok(())
+}
+
+pub fn trace_cmd(ctx: &Ctx, id: &str) -> Result<()> {
+    // accept either a trace id or a message id
+    let mut rows = ctx.store.trace(id)?;
+    if rows.is_empty() {
+        if let Some(trace_id) = ctx.store.trace_id_for_mid(id)? {
+            rows = ctx.store.trace(&trace_id)?;
+        }
+    }
+    anyhow::ensure!(!rows.is_empty(), "no lifecycle events for '{id}'");
+    if ctx.json {
+        println!("{}", serde_json::to_string(&rows)?);
+    } else {
+        for row in rows {
+            let ts = chrono::DateTime::from_timestamp(row.created_at, 0)
+                .map(|t| t.to_rfc3339())
+                .unwrap_or_else(|| row.created_at.to_string());
+            println!("{ts}  {:<16} mid={} {}", row.kind, row.mid, row.detail);
+        }
+    }
+    Ok(())
+}
+
+pub fn dlq_list_cmd(ctx: &Ctx, queue: Option<String>) -> Result<()> {
+    let rows = ctx.store.dlq_list(queue.as_deref())?;
+    if ctx.json {
+        println!("{}", serde_json::to_string(&rows)?);
+    } else if rows.is_empty() {
+        println!("dead-letter queue is empty");
+    } else {
+        for r in rows {
+            println!("{:<28} {:<24} attempts={} reason={}", r.mid, r.queue, r.attempts, r.reason);
+        }
+    }
+    Ok(())
+}
+
+pub fn dlq_retry_cmd(ctx: &Ctx, mid: &str) -> Result<()> {
+    let rec = ctx
+        .store
+        .get_message(mid)?
+        .ok_or_else(|| anyhow::anyhow!("unknown message id '{mid}'"))?;
+    anyhow::ensure!(rec.status == "dead", "message '{mid}' is not dead-lettered (status: {})", rec.status);
+    ctx.store.dlq_retry(mid)?;
+    ctx.store.record_lifecycle(mid, &rec.trace_id, "dlq_retried", "manual retry via cli")?;
+    println!("requeued {mid} on '{}'", rec.queue);
+    Ok(())
+}

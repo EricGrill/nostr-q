@@ -68,6 +68,15 @@ enum Cmd {
         #[arg(long, default_value_t = 15)]
         heartbeat: u64,
     },
+    /// Show queue depth, in-flight, acked, DLQ counts
+    Inspect { queue: String },
+    /// Show the lifecycle timeline for a trace id (or message id)
+    Trace { id: String },
+    /// Dead-letter queue operations
+    Dlq {
+        #[command(subcommand)]
+        cmd: DlqCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -109,6 +118,17 @@ enum QueueCmd {
     },
     /// List queues/topics
     List,
+}
+
+#[derive(Subcommand)]
+enum DlqCmd {
+    /// List dead-lettered messages
+    List {
+        #[arg(long)]
+        queue: Option<String>,
+    },
+    /// Requeue a dead-lettered message
+    Retry { mid: String },
 }
 
 #[tokio::main]
@@ -156,6 +176,21 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Worker { queue, exec, http, concurrency, lease, max_attempts, heartbeat } => {
             let ctx = Ctx::load(cli.config, cli.json)?;
             commands::worker(&ctx, &queue, exec, http, concurrency, lease, max_attempts, heartbeat).await
+        }
+        Cmd::Inspect { queue } => {
+            let ctx = Ctx::load(cli.config, cli.json)?;
+            commands::inspect(&ctx, &queue)
+        }
+        Cmd::Trace { id } => {
+            let ctx = Ctx::load(cli.config, cli.json)?;
+            commands::trace_cmd(&ctx, &id)
+        }
+        Cmd::Dlq { cmd } => {
+            let ctx = Ctx::load(cli.config, cli.json)?;
+            match cmd {
+                DlqCmd::List { queue } => commands::dlq_list_cmd(&ctx, queue),
+                DlqCmd::Retry { mid } => commands::dlq_retry_cmd(&ctx, &mid),
+            }
         }
     }
 }
