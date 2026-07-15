@@ -1404,6 +1404,7 @@ name = "nostr-q-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "chrono",
  "clap",
@@ -1445,7 +1446,10 @@ dependencies = [
  "nostr-q-core",
  "nostr-sdk",
  "serde",
+ "serde_json",
  "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
  "tracing",
 ]
 

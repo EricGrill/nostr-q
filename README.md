@@ -96,9 +96,71 @@ unambiguous `nostr-q` binary.
 See [docs/INSTALL.md](docs/INSTALL.md) for Cargo, Homebrew, shell installer,
 PowerShell, Winget, and Scoop notes.
 
-## Quick Start
+## Quickstart: nostr-q dev
 
-Run a disposable local relay in Docker:
+The fastest way to see a working job flow — no Docker, no external relay, no
+config to write by hand. `nostr-q dev` starts a minimal NIP-01 relay
+*embedded in the CLI process itself*, provisions a disposable config/state/key
+under a dev-labeled directory, registers the embedded relay, and creates two
+example queues (`jobs.email`, a work queue, and `events.demo`, a pub/sub
+topic):
+
+```sh
+nostr-q dev --with-sample
+```
+
+```text
+nostr-q dev: environment ready
+
+  relay:   ws://127.0.0.1:10547 (embedded, in-memory, dev-only)
+  config:  /Users/you/.config/nostr-q/dev/config.toml
+  state:   /Users/you/.config/nostr-q/dev/state.db
+  queues:  jobs.email (work_queue), events.demo (pubsub)
+
+Point other terminals at this environment:
+  export NQ_CONFIG=/Users/you/.config/nostr-q/dev/config.toml
+
+Try it (in another terminal, after exporting NQ_CONFIG above):
+  nostr-q pub jobs.email '{"hello":"world"}'
+  nostr-q worker jobs.email --exec 'cat'
+  nostr-q sub events.demo
+
+Ctrl-C to stop the embedded relay.
+[dev] publishing a sample job to 'jobs.email'...
+[dev] published mid=01... trace=01...
+[dev] worker claimed mid=01... payload={"from":"nostr-q dev --with-sample","hello":"nostr-q"}
+[dev] worker acked mid=01...
+```
+
+`--with-sample` runs an in-process sample worker and publishes one sample job
+so you see the full publish -> claim -> ack flow within a couple of seconds,
+without needing a second terminal. Leave it running and, from another
+terminal, `export NQ_CONFIG` to the path printed above and drive the same
+environment with the ordinary CLI (`pub`, `worker`, `sub`, `inspect`, ...).
+
+The dev environment is disposable and isolated from your real config:
+
+- `--addr <host:port>` picks the relay's bind address (default
+  `127.0.0.1:10547`); if it's already taken, `nostr-q dev` falls back to an
+  ephemeral port and reports the address it actually bound.
+- `--dir <path>` puts a self-contained `config.toml` / `state.db` / `key`
+  under that directory instead of the default dev-labeled location.
+  `NQ_CONFIG`/`NQ_STATE` are honored the same way they are everywhere else in
+  the CLI if set and `--dir` is omitted.
+- Ctrl-C stops the embedded relay (and any sample worker) gracefully; nothing
+  written by `nostr-q dev` touches your regular `nostr-q init` config or
+  state — it's a separate, clearly-labeled `dev` path.
+
+The embedded relay speaks enough of NIP-01 (`EVENT`/`OK`, `REQ`/`EOSE`,
+`CLOSE`) to interoperate with any real Nostr client, including the same
+`NostrTransport` (nostr-sdk) the rest of the CLI uses — it's not a special
+test double, just a minimal, in-memory, single-process relay meant for
+kicking the tires.
+
+## Quick Start (external relay)
+
+For a setup closer to production — a real, persistent relay you also use
+outside this project — run a disposable local relay in Docker:
 
 ```sh
 mkdir -p .local/nostr-rs-relay
@@ -182,6 +244,7 @@ nostr-q trace <trace-id-or-message-id>
 nostr-q dlq list|retry
 nostr-q metrics --addr <host:port> [--with-relays]
 nostr-q serve --addr <host:port> [--token <secret>]
+nostr-q dev [--addr <host:port>] [--dir <path>] [--with-sample]
 ```
 
 ## Metrics
