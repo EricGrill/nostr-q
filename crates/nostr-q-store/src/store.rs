@@ -209,6 +209,15 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Delete a queue's config. A no-op (not an error) if the queue doesn't
+    /// exist, matching `remove_relay`'s idempotent-delete semantics — unlike
+    /// the message mutators below, callers don't need "did this exist" here.
+    pub fn remove_queue(&self, name: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM queues WHERE name = ?1", [name])?;
+        Ok(())
+    }
+
     pub fn add_relay(&self, url: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -275,9 +284,17 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    fn update(&self, sql: &str, params: impl rusqlite::Params) -> Result<()> {
+    /// Run an UPDATE/INSERT and error if it affected zero rows, naming `mid`
+    /// in the error. Every mutator here operates on a specific message id,
+    /// so an unknown mid is treated as a caller error (matching
+    /// `incr_attempts`'s existing "unknown mid is an error" stance) rather
+    /// than a silent no-op.
+    fn update(&self, sql: &str, params: impl rusqlite::Params, mid: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(sql, params)?;
+        let n = conn.execute(sql, params)?;
+        if n == 0 {
+            anyhow::bail!("no message with mid {mid}");
+        }
         Ok(())
     }
 
@@ -303,6 +320,7 @@ impl Store {
             "UPDATE messages SET status='claimed', consumer=?2, lease_expires_at=?3, \
              attempts = MAX(attempts, ?4), updated_at=?5 WHERE mid=?1",
             rusqlite::params![mid, consumer, lease_expires_at, attempt, Self::now()],
+            mid,
         )
     }
 
@@ -310,6 +328,7 @@ impl Store {
         self.update(
             "UPDATE messages SET status='acked', lease_expires_at=NULL, updated_at=?2 WHERE mid=?1",
             rusqlite::params![mid, Self::now()],
+            mid,
         )
     }
 
@@ -317,6 +336,7 @@ impl Store {
         self.update(
             "UPDATE messages SET status='pending', lease_expires_at=NULL, visible_at=?2, updated_at=?3 WHERE mid=?1",
             rusqlite::params![mid, visible_at, Self::now()],
+            mid,
         )
     }
 
@@ -335,10 +355,13 @@ impl Store {
 
     pub fn move_to_dlq(&self, mid: &str, reason: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let n = conn.execute(
             "UPDATE messages SET status='dead', lease_expires_at=NULL, updated_at=?2 WHERE mid=?1",
             rusqlite::params![mid, Self::now()],
         )?;
+        if n == 0 {
+            anyhow::bail!("no message with mid {mid}");
+        }
         conn.execute(
             "INSERT OR REPLACE INTO dlq (mid, queue, reason, attempts, dead_at)
              SELECT mid, queue, ?2, attempts, ?3 FROM messages WHERE mid=?1",
@@ -387,10 +410,13 @@ impl Store {
     /// then measures the budget as `attempts - attempt_floor`.
     pub fn dlq_retry(&self, mid: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let n = conn.execute(
             "UPDATE messages SET status='pending', attempt_floor=attempts, visible_at=0, lease_expires_at=NULL, updated_at=?2 WHERE mid=?1",
             rusqlite::params![mid, Self::now()],
         )?;
+        if n == 0 {
+            anyhow::bail!("no message with mid {mid}");
+        }
         conn.execute("DELETE FROM dlq WHERE mid=?1", [mid])?;
         Ok(())
     }
@@ -405,6 +431,7 @@ impl Store {
         self.update(
             "INSERT INTO lifecycle (mid, trace_id, kind, detail, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             rusqlite::params![mid, trace_id, kind, detail, Self::now()],
+            mid,
         )
     }
 
@@ -607,6 +634,30 @@ mod tests {
             m.attempt_floor, 2,
             "floor marks where the fresh budget starts"
         );
+    }
+
+    #[test]
+    fn missing_mid_mutators_error_instead_of_silently_no_op() {
+        let store = Store::open_in_memory().unwrap();
+        let err = store.mark_claimed("ghost", "pk", 1000, 0).unwrap_err();
+        assert!(err.to_string().contains("ghost"));
+        assert!(store.mark_acked("ghost").is_err());
+        assert!(store.mark_pending("ghost", 1000).is_err());
+        assert!(store.move_to_dlq("ghost", "reason").is_err());
+        assert!(store.dlq_retry("ghost").is_err());
+    }
+
+    #[test]
+    fn remove_queue_deletes_config_and_is_idempotent() {
+        use nostr_q_core::queue::QueueConfig;
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_queue(&QueueConfig::work_queue("jobs.email"))
+            .unwrap();
+        assert!(store.get_queue("jobs.email").unwrap().is_some());
+        store.remove_queue("jobs.email").unwrap();
+        assert!(store.get_queue("jobs.email").unwrap().is_none());
+        store.remove_queue("jobs.email").unwrap(); // idempotent, not an error
     }
 
     #[test]

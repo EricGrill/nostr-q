@@ -14,13 +14,13 @@ use nostr_q_core::protocol::{
     claim_winner, event_attempt, parse_claim_event, parse_message_event, ClaimInfo, NqMessage,
     KIND_ACK, KIND_CLAIM, KIND_DLQ, KIND_MESSAGE, KIND_NACK,
 };
-use nostr_q_core::queue::QueueMode;
+use nostr_q_core::queue::{QueueConfig, QueueMode};
 use nostr_q_relay::Transport;
 use nostr_q_store::{MessageRecord, Store};
 
 pub use nostr_q_core::{envelope, ids, protocol, queue};
 pub use nostr_q_relay as relay;
-pub use nostr_q_store as store_crate;
+pub use nostr_q_store as store;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PublishReceipt {
@@ -118,7 +118,27 @@ impl NostrQ {
             visible_at: 0,
             created_at: Self::now(),
         };
-        self.store.insert_message(&rec)?;
+        let inserted = self.store.insert_message(&rec)?;
+        if !inserted {
+            // Lost a race: another concurrent publish() for the same
+            // (queue, idem) got past the pre-check first and its row is
+            // already committed (INSERT OR IGNORE made ours a no-op). Our
+            // `msg.mid`/event were never persisted locally, so return the
+            // surviving row's receipt instead of one with no backing row.
+            if let Some(key) = &rec.idem_key {
+                if let Some(existing) = self.store.find_by_idem(queue, key)? {
+                    return Ok(PublishReceipt {
+                        mid: existing.mid,
+                        trace_id: existing.trace_id,
+                        event_id: existing.event_id,
+                    });
+                }
+            }
+            return Err(anyhow!(
+                "publish for mid '{}' was not persisted (insert ignored) and no surviving idem row was found",
+                msg.mid
+            ));
+        }
         self.store
             .record_lifecycle(&msg.mid, &msg.trace_id, "published", queue)?;
         Ok(PublishReceipt {
@@ -331,10 +351,21 @@ impl NostrQ {
 
     pub async fn nack(&self, mid: &str, reason: &str) -> Result<NackOutcome> {
         let (rec, event_id) = self.message_ref(mid)?;
-        let config = self
-            .store
-            .get_queue(&rec.queue)?
-            .ok_or_else(|| anyhow!("unknown queue '{}'", rec.queue))?;
+        // A message whose queue config was deleted after it was published
+        // must still be nackable — otherwise it's stuck forever (never
+        // retried, never dead-lettered). Fall back to work_queue defaults
+        // (max_attempts 5, retry_base 5s) rather than erroring.
+        let config = match self.store.get_queue(&rec.queue)? {
+            Some(c) => c,
+            None => {
+                tracing::warn!(
+                    queue = %rec.queue,
+                    mid,
+                    "nack: queue config missing, falling back to defaults"
+                );
+                QueueConfig::work_queue(&rec.queue)
+            }
+        };
         let attempts = self.store.incr_attempts(mid)?;
         let event = build_nack_event(
             &self.keys,
@@ -861,6 +892,75 @@ mod tests {
         assert!(
             nq.try_claim(&rec, 60, 10).await.unwrap(),
             "retry claim must not lose to its own stale pre-nack claim"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_duplicate_idem_publish_agree_on_one_surviving_receipt() {
+        // Two publishers racing to publish under the same (queue, idem) both
+        // pass the pre-check (neither sees the other's row yet) and both
+        // broadcast; only one insert_message can win. The loser must return
+        // the winner's receipt, not a mid with no backing row.
+        let (nq, _transport) = setup();
+        let nq = Arc::new(nq);
+        let mut handles = Vec::new();
+        for n in 0..8u32 {
+            let nq = nq.clone();
+            handles.push(tokio::spawn(async move {
+                nq.publish("jobs.email", json!({"n": n}), Some("race-key".into()))
+                    .await
+                    .unwrap()
+            }));
+        }
+        let mut receipts = Vec::new();
+        for h in handles {
+            receipts.push(h.await.unwrap());
+        }
+        let first_mid = receipts[0].mid.clone();
+        for r in &receipts {
+            assert_eq!(
+                r.mid, first_mid,
+                "all concurrent publishes with the same idem must agree on one surviving mid"
+            );
+        }
+        // exactly one row persisted for this idem key
+        let rec = nq
+            .store()
+            .find_by_idem("jobs.email", "race-key")
+            .unwrap()
+            .expect("surviving row must exist");
+        assert_eq!(rec.mid, first_mid);
+        // every returned receipt must correspond to a real local row (the
+        // bug this guards against: a receipt whose mid has no local row)
+        assert!(nq.store().get_message(&first_mid).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn nack_with_deleted_queue_config_falls_back_to_defaults() {
+        let (nq, _) = setup();
+        let receipt = nq
+            .publish("jobs.email", json!({"n": 1}), None)
+            .await
+            .unwrap();
+
+        // operator (or a bug) deletes the queue config after publish
+        nq.store().remove_queue("jobs.email").unwrap();
+        assert!(nq.store().get_queue("jobs.email").unwrap().is_none());
+
+        // nack must still succeed (using work_queue defaults) instead of
+        // erroring and leaving the message stuck forever
+        let outcome = nq.nack(&receipt.mid, "boom").await.unwrap();
+        match outcome {
+            NackOutcome::Retry { attempt, .. } => assert_eq!(attempt, 1),
+            other => panic!("expected retry with defaults, got {other:?}"),
+        }
+        assert_eq!(
+            nq.store()
+                .get_message(&receipt.mid)
+                .unwrap()
+                .unwrap()
+                .status,
+            "pending"
         );
     }
 

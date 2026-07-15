@@ -200,7 +200,7 @@ Never commit private keys, local databases, or relay state.
 
 ```rust
 use std::sync::Arc;
-use nostr_q::{NostrQ, relay::NostrTransport, store_crate::Store};
+use nostr_q::{NostrQ, relay::NostrTransport, store::Store};
 
 let store = Arc::new(Store::open("state.db".as_ref())?);
 let keys = nostr::Keys::parse(&std::env::var("NOSTR_Q_PRIVATE_KEY")?)?;
