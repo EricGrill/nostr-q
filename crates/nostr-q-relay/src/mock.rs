@@ -1,7 +1,7 @@
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use nostr::{Event, EventId, Filter};
+use nostr::{filter::MatchEventOptions, Event, EventId, Filter};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::transport::{RelayHealth, Transport};
@@ -46,7 +46,7 @@ impl Transport for MockTransport {
             .lock()
             .unwrap()
             .iter()
-            .filter(|e| filter.match_event(e))
+            .filter(|e| filter.match_event(e, MatchEventOptions::new()))
             .cloned()
             .collect();
         // Snapshot stored events first, then subscribe to the broadcast
@@ -64,7 +64,9 @@ impl Transport for MockTransport {
             loop {
                 match live.recv().await {
                     Ok(e) => {
-                        if filter.match_event(&e) && out_tx.send(e).await.is_err() {
+                        if filter.match_event(&e, MatchEventOptions::new())
+                            && out_tx.send(e).await.is_err()
+                        {
                             return;
                         }
                     }
@@ -84,7 +86,7 @@ impl Transport for MockTransport {
             .lock()
             .unwrap()
             .iter()
-            .filter(|e| filter.match_event(e))
+            .filter(|e| filter.match_event(e, MatchEventOptions::new()))
             .cloned()
             .collect())
     }

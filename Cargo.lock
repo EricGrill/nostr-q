@@ -1220,6 +1220,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
+name = "lru"
+version = "0.16.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1270,38 +1276,9 @@ dependencies = [
 
 [[package]]
 name = "negentropy"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e664971378a3987224f7a0e10059782035e89899ae403718ee07de85bec42afe"
-
-[[package]]
-name = "negentropy"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0efe882e02d206d8d279c20eb40e03baf7cb5136a1476dc084a324fbc3ec42d"
-
-[[package]]
-name = "nostr"
-version = "0.39.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d90b55eff1f0747d9e423972179672e1aacac3d3ccee4c1281147eaa90d6491e"
-dependencies = [
- "base64",
- "bech32",
- "bip39",
- "bitcoin_hashes",
- "cbc",
- "chacha20 0.9.1",
- "chacha20poly1305",
- "getrandom 0.2.17",
- "instant",
- "scrypt",
- "secp256k1",
- "serde",
- "serde_json",
- "unicode-normalization",
- "url",
-]
 
 [[package]]
 name = "nostr"
@@ -1314,7 +1291,7 @@ dependencies = [
  "bip39",
  "bitcoin_hashes",
  "cbc",
- "chacha20",
+ "chacha20 0.9.1",
  "chacha20poly1305",
  "getrandom 0.2.17",
  "hex",
@@ -1329,12 +1306,22 @@ dependencies = [
 
 [[package]]
 name = "nostr-database"
-version = "0.39.0"
+version = "0.44.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce07b47c77b8e5a856727885fe0ae47b9aa53d8d853a2190dd479b5a0d6e4f52"
+checksum = "7462c9d8ae5ef6a28d66a192d399ad2530f1f2130b13186296dbb11bdef5b3d1"
 dependencies = [
- "nostr 0.39.0",
+ "lru",
+ "nostr",
  "tokio",
+]
+
+[[package]]
+name = "nostr-gossip"
+version = "0.44.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ade30de16869618919c6b5efc8258f47b654a98b51541eb77f85e8ec5e3c83a6"
+dependencies = [
+ "nostr",
 ]
 
 [[package]]
@@ -1343,7 +1330,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
- "nostr 0.44.4",
+ "nostr",
  "nostr-q-core",
  "nostr-q-relay",
  "nostr-q-store",
@@ -1362,7 +1349,7 @@ dependencies = [
  "chrono",
  "clap",
  "dirs",
- "nostr 0.44.4",
+ "nostr",
  "nostr-q",
  "nostr-q-worker",
  "serde",
@@ -1380,7 +1367,7 @@ name = "nostr-q-core"
 version = "0.1.0"
 dependencies = [
  "chrono",
- "nostr 0.44.4",
+ "nostr",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -1393,7 +1380,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "nostr 0.44.4",
+ "nostr",
  "nostr-q-core",
  "nostr-sdk",
  "serde",
@@ -1421,7 +1408,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
- "nostr 0.44.4",
+ "nostr",
  "nostr-q",
  "reqwest",
  "serde_json",
@@ -1434,16 +1421,17 @@ dependencies = [
 
 [[package]]
 name = "nostr-relay-pool"
-version = "0.39.0"
+version = "0.44.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "211ac5bbdda1a8eec0c21814a838da832038767a5d354fe2fcc1ca438cae56fd"
+checksum = "91b2c039df4f96c4bf7dae52a74fd5516ad6dda83a11c0c69dea91b5255a4f37"
 dependencies = [
  "async-utility",
  "async-wsocket",
  "atomic-destructor",
- "negentropy 0.3.1",
- "negentropy 0.5.0",
- "nostr 0.39.0",
+ "hex",
+ "lru",
+ "negentropy",
+ "nostr",
  "nostr-database",
  "tokio",
  "tracing",
@@ -1451,13 +1439,14 @@ dependencies = [
 
 [[package]]
 name = "nostr-sdk"
-version = "0.39.0"
+version = "0.44.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5baca581deb810a88bb51c54d1d7980f4506a64a3e9a19270829b406e47adf31"
+checksum = "471732576710e779b64f04c55e3f8b5292f865fea228436daf19694f0bf70393"
 dependencies = [
  "async-utility",
- "nostr 0.39.0",
+ "nostr",
  "nostr-database",
+ "nostr-gossip",
  "nostr-relay-pool",
  "tokio",
  "tracing",
@@ -2220,7 +2209,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
