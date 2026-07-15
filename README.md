@@ -200,7 +200,11 @@ crates/
   nostr-q-cli/     `nq` CLI target crate
 ```
 
-Public docs will be added under `docs/` as the CLI and protocol stabilize.
+Supporting docs:
+
+- [`nostr-q.srs.md`](nostr-q.srs.md): product requirements and roadmap
+- [`docs/superpowers/plans/2026-07-15-nostr-q-mvp.md`](docs/superpowers/plans/2026-07-15-nostr-q-mvp.md):
+  MVP implementation plan
 
 ## Development Checks
 

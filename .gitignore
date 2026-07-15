@@ -1,19 +1,4 @@
 /target
 *.db
-
-# Local agent/orchestration artifacts
-.agents/
-.codex/
-.omx/
 .superpowers/
-AGENTS.md
-CLAUDE.md
-GEMINI.md
-
-# Local planning artifacts
-docs/**/plans/
-docs/superpowers/
-*.srs.md
-
-# Local runtime data
 .local/
