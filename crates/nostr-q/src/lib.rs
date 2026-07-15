@@ -440,7 +440,7 @@ impl NostrQ {
                     attempt_floor: 0,
                     idem_key: msg.idem.clone(),
                     visible_at: 0,
-                    created_at: event.created_at.as_u64() as i64,
+                    created_at: event.created_at.as_secs() as i64,
                 };
                 match store.insert_message(&rec) {
                     Ok(true) => {

@@ -201,7 +201,7 @@ pub fn parse_claim_event(event: &Event) -> Result<ClaimInfo, ProtocolError> {
     Ok(ClaimInfo {
         claimer: event.pubkey,
         claim_event_id: event.id,
-        created_at: event.created_at.as_u64() as i64,
+        created_at: event.created_at.as_secs() as i64,
         lease_expires_at,
         attempt: tag_value(event, "attempt")
             .and_then(|a| a.parse().ok())

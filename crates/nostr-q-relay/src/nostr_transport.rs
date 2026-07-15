@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use nostr::{Event, EventId, Filter, Keys};
+use nostr::{filter::MatchEventOptions, Event, EventId, Filter, Keys};
 use nostr_sdk::prelude::*;
 use tokio::sync::mpsc;
 
@@ -31,7 +31,7 @@ impl NostrTransport {
 #[async_trait]
 impl Transport for NostrTransport {
     async fn publish(&self, event: Event) -> anyhow::Result<EventId> {
-        let output = self.client.send_event(event).await?;
+        let output = self.client.send_event(&event).await?;
         anyhow::ensure!(
             !output.success.is_empty(),
             "no relay accepted the event (failed: {:?})",
@@ -49,7 +49,9 @@ impl Transport for NostrTransport {
                 match notifications.recv().await {
                     Ok(notification) => {
                         if let RelayPoolNotification::Event { event, .. } = notification {
-                            if filter.match_event(&event) && tx.send(*event).await.is_err() {
+                            if filter.match_event(&event, MatchEventOptions::new())
+                                && tx.send(*event).await.is_err()
+                            {
                                 return;
                             }
                         }
