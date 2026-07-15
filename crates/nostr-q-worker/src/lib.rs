@@ -8,7 +8,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use nostr_q::envelope::Envelope;
 use nostr_q::store::MessageRecord;
-use nostr_q::NostrQ;
+use nostr_q::{NackOutcome, NostrQ};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
@@ -191,7 +191,24 @@ pub async fn run_worker(
                             HandlerOutcome::Success => nq.ack(&rec.mid).await,
                             HandlerOutcome::Failure(reason) => {
                                 tracing::warn!(mid = %rec.mid, reason = %reason, "handler failed");
-                                nq.nack(&rec.mid, &reason).await.map(|_| ())
+                                nq.nack(&rec.mid, &reason)
+                                    .await
+                                    .map(|outcome| match outcome {
+                                        NackOutcome::Retry {
+                                            attempt,
+                                            visible_at,
+                                        } => {
+                                            tracing::info!(
+                                                mid = %rec.mid,
+                                                attempt,
+                                                visible_at,
+                                                "retry scheduled"
+                                            );
+                                        }
+                                        NackOutcome::DeadLettered => {
+                                            tracing::warn!(mid = %rec.mid, "dead-lettered");
+                                        }
+                                    })
                             }
                         };
                         if let Err(e) = settled {

@@ -137,13 +137,24 @@ enum DlqCmd {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_writer(std::io::stderr)
-        .init();
     let cli = Cli::parse();
+    // `--json` means "machine-readable everywhere": structured JSON logs on
+    // stderr (SRS §15.3), keeping stdout free for the command's own JSON
+    // output.
+    if cli.json {
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .json()
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .init();
+    }
     match cli.cmd {
-        Cmd::Init => commands::init(cli.config),
+        Cmd::Init => commands::init(cli.config, cli.json),
         Cmd::Key { cmd } => {
             let ctx = Ctx::load(cli.config, cli.json)?;
             match cmd {

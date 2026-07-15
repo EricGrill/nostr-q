@@ -36,7 +36,8 @@ reqwest = { version = "0.12", features = ["json"] }
 toml = "1.1"
 dirs = "5"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+futures = "0.3"
 tempfile = "3"
 wiremock = "0.6"
 nostr-q-core = { path = "crates/nostr-q-core" }

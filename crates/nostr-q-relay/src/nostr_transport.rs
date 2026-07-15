@@ -86,40 +86,46 @@ impl Transport for NostrTransport {
     }
 
     async fn health(&self) -> Vec<RelayHealth> {
-        let mut out = Vec::new();
-        for (url, relay) in self.client.relays().await {
-            // `Client::connect()` kicks off the websocket handshake in the
-            // background and returns immediately, so a status read right
-            // after connect() races the handshake and reads it as `not
-            // connected` even when the relay is healthy. Give each relay a
-            // bounded window to finish the handshake before deciding it's
-            // down.
-            let deadline = Instant::now() + Duration::from_secs(3);
-            let mut connected = relay.status() == RelayStatus::Connected;
-            while !connected && Instant::now() < deadline {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                connected = relay.status() == RelayStatus::Connected;
+        // Each relay's probe below can wait up to a 3s handshake window plus
+        // a 5s fetch timeout. Probing relays one at a time would make total
+        // latency scale with relay count (N x up to 8s); run every relay's
+        // probe concurrently instead so the whole health check takes as
+        // long as the single slowest relay.
+        let probes = self.client.relays().await.into_iter().map(|(url, relay)| {
+            let client = self.client.clone();
+            async move {
+                // `Client::connect()` kicks off the websocket handshake in the
+                // background and returns immediately, so a status read right
+                // after connect() races the handshake and reads it as `not
+                // connected` even when the relay is healthy. Give each relay a
+                // bounded window to finish the handshake before deciding it's
+                // down.
+                let deadline = Instant::now() + Duration::from_secs(3);
+                let mut connected = relay.status() == RelayStatus::Connected;
+                while !connected && Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    connected = relay.status() == RelayStatus::Connected;
+                }
+                let latency_ms = if connected {
+                    let start = Instant::now();
+                    let probe = client
+                        .fetch_events_from(
+                            [url.clone()],
+                            Filter::new().limit(1),
+                            Duration::from_secs(5),
+                        )
+                        .await;
+                    probe.ok().map(|_| start.elapsed().as_millis() as u64)
+                } else {
+                    None
+                };
+                RelayHealth {
+                    url: url.to_string(),
+                    connected,
+                    latency_ms,
+                }
             }
-            let latency_ms = if connected {
-                let start = Instant::now();
-                let probe = self
-                    .client
-                    .fetch_events_from(
-                        [url.clone()],
-                        Filter::new().limit(1),
-                        Duration::from_secs(5),
-                    )
-                    .await;
-                probe.ok().map(|_| start.elapsed().as_millis() as u64)
-            } else {
-                None
-            };
-            out.push(RelayHealth {
-                url: url.to_string(),
-                connected,
-                latency_ms,
-            });
-        }
-        out
+        });
+        futures::future::join_all(probes).await
     }
 }
