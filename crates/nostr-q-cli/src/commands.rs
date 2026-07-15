@@ -8,6 +8,8 @@ use nostr_q::relay::{NostrTransport, Transport};
 use nostr_q::store_crate::Store;
 use nostr_q::NostrQ;
 use nostr_q::queue::{Delivery, QueueConfig, QueueMode};
+use nostr_q_worker::{handlers::ExecHandler, run_worker, Handler, WorkerOptions};
+use tokio_util::sync::CancellationToken;
 
 use crate::config::{self, Config};
 
@@ -196,6 +198,48 @@ pub async fn publish(
         println!("published mid={} trace={} event={}", receipt.mid, receipt.trace_id, receipt.event_id);
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn worker(
+    ctx: &Ctx,
+    queue: &str,
+    exec: Option<String>,
+    http: Option<String>,
+    concurrency: usize,
+    lease: Option<u64>,
+    max_attempts: Option<u32>,
+    heartbeat: u64,
+) -> Result<()> {
+    let mut qcfg = ctx
+        .store
+        .get_queue(queue)?
+        .ok_or_else(|| anyhow::anyhow!("unknown queue '{queue}' — create it first"))?;
+    if let Some(m) = max_attempts {
+        qcfg.max_attempts = m;
+        ctx.store.upsert_queue(&qcfg)?;
+    }
+    let handler: Arc<dyn Handler> = match (exec, http) {
+        (Some(command), None) => Arc::new(ExecHandler { command }),
+        (None, Some(_url)) => anyhow::bail!("--http is implemented in the next task"),
+        _ => anyhow::bail!("provide exactly one of --exec or --http"),
+    };
+    let nq = Arc::new(ctx.connect().await?);
+    let opts = WorkerOptions {
+        concurrency,
+        lease_seconds: lease.unwrap_or(qcfg.lease_seconds),
+        heartbeat_seconds: heartbeat,
+        settle_ms: 750,
+        poll_ms: 500,
+    };
+    let shutdown = CancellationToken::new();
+    let sd = shutdown.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        eprintln!("shutting down gracefully...");
+        sd.cancel();
+    });
+    run_worker(nq, queue.to_string(), handler, opts, shutdown).await
 }
 
 pub async fn subscribe_cmd(ctx: &Ctx, topic: &str) -> Result<()> {

@@ -47,6 +47,27 @@ enum Cmd {
     },
     /// Subscribe to a pub/sub topic and print events
     Sub { topic: String },
+    /// Run a worker against a work queue
+    Worker {
+        queue: String,
+        /// Shell command handler (payload on stdin, NQ_* env vars)
+        #[arg(long)]
+        exec: Option<String>,
+        /// HTTP handler endpoint (POST, 2xx = ack)
+        #[arg(long)]
+        http: Option<String>,
+        #[arg(long, default_value_t = 1)]
+        concurrency: usize,
+        /// Lease seconds (default: queue config)
+        #[arg(long)]
+        lease: Option<u64>,
+        /// Override queue max attempts
+        #[arg(long)]
+        max_attempts: Option<u32>,
+        /// Heartbeat interval seconds
+        #[arg(long, default_value_t = 15)]
+        heartbeat: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -131,6 +152,10 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Sub { topic } => {
             let ctx = Ctx::load(cli.config, cli.json)?;
             commands::subscribe_cmd(&ctx, &topic).await
+        }
+        Cmd::Worker { queue, exec, http, concurrency, lease, max_attempts, heartbeat } => {
+            let ctx = Ctx::load(cli.config, cli.json)?;
+            commands::worker(&ctx, &queue, exec, http, concurrency, lease, max_attempts, heartbeat).await
         }
     }
 }

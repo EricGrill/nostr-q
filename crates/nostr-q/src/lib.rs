@@ -240,6 +240,12 @@ impl NostrQ {
         Ok(rx)
     }
 
+    pub async fn heartbeat(&self, queue: &str) -> Result<()> {
+        let event = nostr_q_core::protocol::build_heartbeat_event(&self.keys, queue)?;
+        self.transport.publish(event).await?;
+        Ok(())
+    }
+
     pub async fn spawn_ingest(&self, queue: &str) -> Result<JoinHandle<()>> {
         let mut events = self.transport.subscribe(Self::message_filter(queue)).await?;
         let store = self.store.clone();
