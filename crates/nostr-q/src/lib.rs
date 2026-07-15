@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use nostr::{Filter, Keys, Kind};
+use nostr::{EventId, Filter, Keys, Kind};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -9,7 +9,11 @@ use tokio::task::JoinHandle;
 
 use nostr_q_core::envelope::Envelope;
 use nostr_q_core::ids::{new_mid, new_trace_id};
-use nostr_q_core::protocol::{build_message_event, parse_message_event, NqMessage, KIND_MESSAGE};
+use nostr_q_core::protocol::{
+    build_ack_event, build_claim_event, build_dlq_event, build_message_event, build_nack_event,
+    claim_winner, parse_claim_event, parse_message_event, ClaimInfo, NqMessage, KIND_CLAIM,
+    KIND_MESSAGE,
+};
 use nostr_q_core::queue::QueueMode;
 use nostr_q_relay::Transport;
 use nostr_q_store::{MessageRecord, Store};
@@ -23,6 +27,19 @@ pub struct PublishReceipt {
     pub mid: String,
     pub trace_id: String,
     pub event_id: String,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum NackOutcome {
+    Retry { attempt: u32, visible_at: i64 },
+    DeadLettered,
+}
+
+/// Exponential backoff: base * 2^(attempt-1), capped at 1 hour.
+pub fn backoff_secs(retry_base_seconds: u64, attempt: u32) -> u64 {
+    retry_base_seconds
+        .saturating_mul(1u64 << (attempt.saturating_sub(1)).min(20))
+        .min(3600)
 }
 
 pub struct NostrQ {
@@ -109,6 +126,100 @@ impl NostrQ {
 
     fn message_filter(topic: &str) -> Filter {
         Filter::new().kind(Kind::Custom(KIND_MESSAGE)).hashtag(topic)
+    }
+
+    pub async fn try_claim(
+        &self,
+        rec: &MessageRecord,
+        lease_seconds: u64,
+        settle_ms: u64,
+    ) -> Result<bool> {
+        let now = Self::now();
+        let lease_expires_at = now + lease_seconds as i64;
+        let message_event_id = EventId::from_hex(&rec.event_id)?;
+        let claim = build_claim_event(
+            &self.keys,
+            message_event_id,
+            &rec.queue,
+            &rec.mid,
+            &rec.trace_id,
+            lease_expires_at,
+        )?;
+        let our_claim_id = claim.id;
+        self.transport.publish(claim).await?;
+        tokio::time::sleep(std::time::Duration::from_millis(settle_ms)).await;
+
+        let filter = Filter::new()
+            .kind(Kind::Custom(KIND_CLAIM))
+            .event(message_event_id);
+        let claims: Vec<ClaimInfo> = self
+            .transport
+            .query(filter)
+            .await?
+            .iter()
+            .filter_map(|e| parse_claim_event(e).ok())
+            .collect();
+        let we_won = claim_winner(&claims, now)
+            .map(|w| w.claim_event_id == our_claim_id)
+            .unwrap_or(false);
+        if we_won {
+            let consumer = self.keys.public_key().to_hex();
+            self.store.mark_claimed(&rec.mid, &consumer, lease_expires_at)?;
+            self.store
+                .record_lifecycle(&rec.mid, &rec.trace_id, "claimed", &consumer)?;
+        }
+        Ok(we_won)
+    }
+
+    fn message_ref(&self, mid: &str) -> Result<(MessageRecord, EventId)> {
+        let rec = self
+            .store
+            .get_message(mid)?
+            .ok_or_else(|| anyhow!("unknown message id '{mid}'"))?;
+        let event_id = EventId::from_hex(&rec.event_id)?;
+        Ok((rec, event_id))
+    }
+
+    pub async fn ack(&self, mid: &str) -> Result<()> {
+        let (rec, event_id) = self.message_ref(mid)?;
+        let event = build_ack_event(&self.keys, event_id, &rec.queue, mid, &rec.trace_id)?;
+        self.transport.publish(event).await?;
+        self.store.mark_acked(mid)?;
+        self.store.record_lifecycle(mid, &rec.trace_id, "acked", "")?;
+        Ok(())
+    }
+
+    pub async fn nack(&self, mid: &str, reason: &str) -> Result<NackOutcome> {
+        let (rec, event_id) = self.message_ref(mid)?;
+        let config = self
+            .store
+            .get_queue(&rec.queue)?
+            .ok_or_else(|| anyhow!("unknown queue '{}'", rec.queue))?;
+        let attempts = self.store.incr_attempts(mid)?;
+        let event = build_nack_event(
+            &self.keys, event_id, &rec.queue, mid, &rec.trace_id, attempts, reason,
+        )?;
+        self.transport.publish(event).await?;
+        self.store.record_lifecycle(mid, &rec.trace_id, "nacked", reason)?;
+
+        if attempts >= config.max_attempts {
+            let dlq = build_dlq_event(&self.keys, event_id, &rec.queue, mid, &rec.trace_id, reason)?;
+            self.transport.publish(dlq).await?;
+            self.store.move_to_dlq(mid, reason)?;
+            self.store
+                .record_lifecycle(mid, &rec.trace_id, "dead_lettered", reason)?;
+            Ok(NackOutcome::DeadLettered)
+        } else {
+            let visible_at = Self::now() + backoff_secs(config.retry_base_seconds, attempts) as i64;
+            self.store.mark_pending(mid, visible_at)?;
+            self.store.record_lifecycle(
+                mid,
+                &rec.trace_id,
+                "retry_scheduled",
+                &format!("attempt {attempts}, visible_at {visible_at}"),
+            )?;
+            Ok(NackOutcome::Retry { attempt: attempts, visible_at })
+        }
     }
 
     pub async fn subscribe(&self, topic: &str) -> Result<mpsc::Receiver<NqMessage>> {
@@ -276,5 +387,98 @@ mod tests {
         let rec = found.expect("ingest should store the remote message");
         assert_eq!(rec.status, "pending");
         assert_eq!(rec.event_id, receipt.event_id);
+    }
+
+    #[tokio::test]
+    async fn claim_ack_happy_path() {
+        let (nq, transport) = setup();
+        let receipt = nq.publish("jobs.email", json!({"n": 1}), None).await.unwrap();
+        let rec = nq.store().get_message(&receipt.mid).unwrap().unwrap();
+
+        assert!(nq.try_claim(&rec, 60, 10).await.unwrap());
+        assert_eq!(nq.store().get_message(&receipt.mid).unwrap().unwrap().status, "claimed");
+
+        nq.ack(&receipt.mid).await.unwrap();
+        assert_eq!(nq.store().get_message(&receipt.mid).unwrap().unwrap().status, "acked");
+
+        // claim + ack events were published
+        let claims = transport
+            .query(nostr::Filter::new().kind(nostr::Kind::Custom(nostr_q_core::protocol::KIND_CLAIM)))
+            .await
+            .unwrap();
+        assert_eq!(claims.len(), 1);
+        let kinds: Vec<String> = nq.store().trace(&receipt.trace_id).unwrap()
+            .iter().map(|l| l.kind.clone()).collect();
+        assert_eq!(kinds, vec!["published", "claimed", "acked"]);
+    }
+
+    #[tokio::test]
+    async fn competing_claims_only_one_winner() {
+        // two workers, shared transport, same message
+        let transport = Arc::new(MockTransport::new());
+        let mk = |t: Arc<MockTransport>| {
+            let store = Arc::new(Store::open_in_memory().unwrap());
+            store.upsert_queue(&QueueConfig::work_queue("jobs.email")).unwrap();
+            NostrQ::new(Keys::generate(), store, t)
+        };
+        let producer = mk(transport.clone());
+        let w1 = mk(transport.clone());
+        let w2 = mk(transport.clone());
+        let _i1 = w1.spawn_ingest("jobs.email").await.unwrap();
+        let _i2 = w2.spawn_ingest("jobs.email").await.unwrap();
+        let receipt = producer.publish("jobs.email", json!({"n": 1}), None).await.unwrap();
+
+        // wait for both ingests
+        for w in [&w1, &w2] {
+            for _ in 0..40 {
+                if w.store().get_message(&receipt.mid).unwrap().is_some() { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+        let r1 = w1.store().get_message(&receipt.mid).unwrap().unwrap();
+        let r2 = w2.store().get_message(&receipt.mid).unwrap().unwrap();
+        let (a, b) = tokio::join!(w1.try_claim(&r1, 60, 300), w2.try_claim(&r2, 60, 300));
+        let wins = [a.unwrap(), b.unwrap()];
+        assert_eq!(wins.iter().filter(|w| **w).count(), 1, "exactly one worker must win the claim");
+    }
+
+    #[tokio::test]
+    async fn nack_retries_then_dead_letters() {
+        let (nq, transport) = setup();
+        // tighten policy for the test
+        let mut q = nq.store().get_queue("jobs.email").unwrap().unwrap();
+        q.max_attempts = 2;
+        nq.store().upsert_queue(&q).unwrap();
+
+        let receipt = nq.publish("jobs.email", json!({"n": 1}), None).await.unwrap();
+
+        let out1 = nq.nack(&receipt.mid, "boom").await.unwrap();
+        match out1 {
+            NackOutcome::Retry { attempt, visible_at } => {
+                assert_eq!(attempt, 1);
+                assert!(visible_at > chrono::Utc::now().timestamp());
+            }
+            other => panic!("expected retry, got {other:?}"),
+        }
+        assert_eq!(nq.store().get_message(&receipt.mid).unwrap().unwrap().status, "pending");
+
+        let out2 = nq.nack(&receipt.mid, "boom again").await.unwrap();
+        assert_eq!(out2, NackOutcome::DeadLettered);
+        assert_eq!(nq.store().get_message(&receipt.mid).unwrap().unwrap().status, "dead");
+        assert_eq!(nq.store().dlq_list(Some("jobs.email")).unwrap().len(), 1);
+
+        let dlq_events = transport
+            .query(nostr::Filter::new().kind(nostr::Kind::Custom(nostr_q_core::protocol::KIND_DLQ)))
+            .await
+            .unwrap();
+        assert_eq!(dlq_events.len(), 1);
+    }
+
+    #[test]
+    fn backoff_is_exponential_and_capped() {
+        assert_eq!(backoff_secs(5, 1), 5);
+        assert_eq!(backoff_secs(5, 2), 10);
+        assert_eq!(backoff_secs(5, 3), 20);
+        assert_eq!(backoff_secs(5, 30), 3600); // capped
     }
 }
