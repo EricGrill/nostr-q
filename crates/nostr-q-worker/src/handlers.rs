@@ -32,22 +32,39 @@ impl Handler for ExecHandler {
             Ok(c) => c,
             Err(e) => return HandlerOutcome::Failure(format!("spawn failed: {e}")),
         };
+        let mut stdin_error = None;
         if let Some(mut stdin) = child.stdin.take() {
             let payload = job.payload.to_string();
             if let Err(e) = stdin.write_all(payload.as_bytes()).await {
-                return HandlerOutcome::Failure(format!("stdin write failed: {e}"));
+                if e.kind() != std::io::ErrorKind::BrokenPipe {
+                    stdin_error = Some(e);
+                }
             }
         }
         match child.wait_with_output().await {
-            Ok(out) if out.status.success() => HandlerOutcome::Success,
-            Ok(out) => HandlerOutcome::Failure(format!(
-                "exit {}: {}",
-                out.status
-                    .code()
-                    .map(|c| c.to_string())
-                    .unwrap_or_else(|| "signal".into()),
-                String::from_utf8_lossy(&out.stderr).trim()
-            )),
+            Ok(out) if out.status.success() && stdin_error.is_none() => HandlerOutcome::Success,
+            Ok(out) if out.status.success() => {
+                HandlerOutcome::Failure(format!("stdin write failed: {}", stdin_error.unwrap()))
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let stderr = stderr.trim();
+                let detail = if stderr.is_empty() {
+                    stdin_error
+                        .map(|e| format!("stdin write failed: {e}"))
+                        .unwrap_or_default()
+                } else {
+                    stderr.to_string()
+                };
+                HandlerOutcome::Failure(format!(
+                    "exit {}: {}",
+                    out.status
+                        .code()
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "signal".into()),
+                    detail
+                ))
+            }
             Err(e) => HandlerOutcome::Failure(format!("wait failed: {e}")),
         }
     }
