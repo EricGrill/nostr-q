@@ -56,6 +56,17 @@ impl NostrQ {
             .store
             .get_queue(queue)?
             .ok_or_else(|| anyhow!("unknown queue '{queue}' — create it with `nq queue create {queue}`"))?;
+        // Idempotent publish: a repeat (queue, idem) returns the original
+        // receipt without re-broadcasting.
+        if let Some(key) = &idem {
+            if let Some(existing) = self.store.find_by_idem(queue, key)? {
+                return Ok(PublishReceipt {
+                    mid: existing.mid,
+                    trace_id: existing.trace_id,
+                    event_id: existing.event_id,
+                });
+            }
+        }
         let msg = NqMessage {
             mid: new_mid(),
             queue: queue.to_string(),
@@ -145,5 +156,27 @@ mod tests {
     async fn publish_to_unknown_queue_errors() {
         let (nq, _) = setup();
         assert!(nq.publish("nope", json!({}), None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn duplicate_idem_returns_existing_receipt_without_rebroadcast() {
+        let (nq, transport) = setup();
+        let first = nq
+            .publish("jobs.email", json!({"n": 1}), Some("order-1".into()))
+            .await
+            .unwrap();
+        let second = nq
+            .publish("jobs.email", json!({"n": 2}), Some("order-1".into()))
+            .await
+            .unwrap();
+        assert_eq!(second.mid, first.mid);
+        assert_eq!(second.event_id, first.event_id);
+        let events = transport
+            .query(nostr::Filter::new().kind(nostr::Kind::Custom(
+                nostr_q_core::protocol::KIND_MESSAGE,
+            )))
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1, "duplicate idem must not re-broadcast");
     }
 }

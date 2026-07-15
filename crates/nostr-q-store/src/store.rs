@@ -246,6 +246,15 @@ impl Store {
         Ok(rows.next().transpose()?)
     }
 
+    pub fn find_by_idem(&self, queue: &str, idem_key: &str) -> Result<Option<MessageRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {MSG_COLS} FROM messages WHERE queue = ?1 AND idem_key = ?2"
+        ))?;
+        let mut rows = stmt.query_map(rusqlite::params![queue, idem_key], row_to_message)?;
+        Ok(rows.next().transpose()?)
+    }
+
     pub fn claimable(&self, queue: &str, now: i64, limit: u32) -> Result<Vec<MessageRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&format!(
@@ -493,6 +502,17 @@ mod tests {
         b.idem_key = Some("order-42".into());
         assert!(store.insert_message(&a).unwrap());
         assert!(!store.insert_message(&b).unwrap());
+    }
+
+    #[test]
+    fn find_by_idem_returns_existing() {
+        let store = Store::open_in_memory().unwrap();
+        let mut a = rec("m1", "q");
+        a.idem_key = Some("order-42".into());
+        store.insert_message(&a).unwrap();
+        let found = store.find_by_idem("q", "order-42").unwrap().unwrap();
+        assert_eq!(found.mid, "m1");
+        assert!(store.find_by_idem("q", "nope").unwrap().is_none());
     }
 
     #[test]
