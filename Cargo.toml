@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/nostr-q-core",
+    "crates/nostr-q-store",
+    "crates/nostr-q-relay",
+    "crates/nostr-q",
+    "crates/nostr-q-worker",
+    "crates/nostr-q-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+async-trait = "0.1"
+ulid = "1"
+chrono = { version = "0.4", features = ["serde"] }
+nostr = "0.39"
+nostr-sdk = "0.39"
+rusqlite = { version = "0.31", features = ["bundled"] }
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", features = ["json"] }
+toml = "0.8"
+dirs = "5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tempfile = "3"
+wiremock = "0.6"
+nostr-q-core = { path = "crates/nostr-q-core" }
+nostr-q-store = { path = "crates/nostr-q-store" }
+nostr-q-relay = { path = "crates/nostr-q-relay" }
+nostr-q = { path = "crates/nostr-q" }
+nostr-q-worker = { path = "crates/nostr-q-worker" }
