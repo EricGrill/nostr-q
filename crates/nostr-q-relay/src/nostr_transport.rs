@@ -37,6 +37,17 @@ impl Transport for NostrTransport {
             "no relay accepted the event (failed: {:?})",
             output.failed
         );
+        // Any-one-accepted is still success (unchanged semantics), but a
+        // partial failure means some relays now diverge from the rest of
+        // the pool on this event — surface that instead of silently
+        // dropping `output.failed`.
+        if !output.failed.is_empty() {
+            tracing::warn!(
+                event_id = %output.val,
+                failed_relays = ?output.failed,
+                "event accepted by at least one relay, but rejected/failed on others"
+            );
+        }
         Ok(output.val)
     }
 
