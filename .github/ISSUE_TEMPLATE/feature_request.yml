@@ -1,0 +1,39 @@
+name: Feature request
+description: Propose a new capability or improvement.
+title: "feat: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What workflow is blocked or painful today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What should Nostr-Q do?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: What did you consider instead?
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - CLI
+        - SDK
+        - Worker runtime
+        - Relay transport
+        - Storage
+        - Protocol
+        - Docs/release
+    validations:
+      required: true

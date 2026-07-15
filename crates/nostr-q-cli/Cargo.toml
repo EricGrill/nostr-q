@@ -1,0 +1,40 @@
+[package]
+name = "nostr-q-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Command-line interface for Nostr-Q message queues and pub/sub over Nostr relays"
+categories = ["command-line-utilities"]
+keywords = ["nostr", "queue", "pubsub", "cli"]
+
+[[bin]]
+name = "nostr-q"
+path = "src/main.rs"
+
+[package.metadata.dist]
+dist = true
+formula = "nostr-q"
+display-name = "Nostr-Q"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+dirs.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+chrono.workspace = true
+nostr.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+nostr-q.workspace = true
+nostr-q-worker.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

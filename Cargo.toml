@@ -1,0 +1,78 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/nostr-q-core",
+    "crates/nostr-q-store",
+    "crates/nostr-q-relay",
+    "crates/nostr-q",
+    "crates/nostr-q-worker",
+    "crates/nostr-q-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Eric Grill"]
+repository = "https://github.com/EricGrill/nostr-q"
+homepage = "https://github.com/EricGrill/nostr-q"
+readme = "README.md"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+async-trait = "0.1"
+ulid = "1"
+chrono = { version = "0.4", features = ["serde"] }
+nostr = "0.39"
+nostr-sdk = "0.39"
+rusqlite = { version = "0.31", features = ["bundled"] }
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", features = ["json"] }
+toml = "0.8"
+dirs = "5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tempfile = "3"
+wiremock = "0.6"
+nostr-q-core = { path = "crates/nostr-q-core" }
+nostr-q-store = { path = "crates/nostr-q-store" }
+nostr-q-relay = { path = "crates/nostr-q-relay" }
+nostr-q = { path = "crates/nostr-q" }
+nostr-q-worker = { path = "crates/nostr-q-worker" }
+
+# Config for 'dist'
+[workspace.metadata.dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.32.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+installers = ["shell", "powershell", "homebrew"]
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = [
+    "aarch64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]
+packages = ["nostr-q-cli"]
+# A GitHub repo to push Homebrew formulas to
+tap = "EricGrill/homebrew-tap"
+# Publish jobs to run in CI
+publish-jobs = ["homebrew"]
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# Where to host releases
+hosting = "github"
+# Whether to install an updater program
+install-updater = false
+
+[profile.dist]
+inherits = "release"
+lto = "thin"
