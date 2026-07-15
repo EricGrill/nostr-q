@@ -181,6 +181,7 @@ nostr-q inspect <queue>
 nostr-q trace <trace-id-or-message-id>
 nostr-q dlq list|retry
 nostr-q metrics --addr <host:port> [--with-relays]
+nostr-q serve --addr <host:port> [--token <secret>]
 ```
 
 ## Metrics
@@ -204,6 +205,47 @@ unknown) labeled `url="<relay-url>"`. This does a live network health check per
 scrape, so it's opt-in.
 
 Any path other than `GET /metrics` returns `404`.
+
+## HTTP Ingress
+
+`nostr-q serve` runs an HTTP publish ingress so any language can publish a
+message without linking the Rust SDK:
+
+```sh
+nostr-q serve --addr 127.0.0.1:8787 --token devsecret
+curl -s -XPOST -H 'Authorization: Bearer devsecret' \
+  -H 'Idempotency-Key: order-1' \
+  -d '{"to":"a@b.c"}' \
+  'localhost:8787/pub/jobs.email'
+```
+
+Routes:
+
+| Route | Behavior |
+| --- | --- |
+| `POST /pub/<queue>` | Publishes the JSON request body to `<queue>`. Returns `200` with `{"mid","trace_id","event_id"}`. `404` for an unknown queue, `400` for malformed JSON, `413` over the 1 MiB body limit. |
+| `GET /healthz` | `200 {"ok":true}`, unauthenticated. |
+
+Optional `/pub/<queue>` inputs:
+
+- `Idempotency-Key: <key>` header — dedupes repeat publishes (same receipt returned, no re-broadcast).
+- `?delay=<seconds>` — delay delivery (maps to `not_before`).
+- `?ttl=<seconds>` — expire the message after N seconds (maps to `expires_at`).
+
+**Access control (required):** the ingress signs and publishes with the
+node's private key, so it is access-controlled by default:
+
+- Default bind is `127.0.0.1` (localhost only).
+- `--token <secret>` (or env `NQ_INGRESS_TOKEN`) requires every `/pub/*`
+  request to carry `Authorization: Bearer <secret>`; missing/wrong token is
+  `401`.
+- With no token configured, `nostr-q serve` **refuses to start** on any
+  non-loopback `--addr` — an unauthenticated signing endpoint must never be
+  exposed off localhost. A loopback bind with no token is allowed for local
+  dev (logs a warning).
+
+See [`examples/`](examples/) for Python and TypeScript publisher clients and
+a matching `nostr-q worker --http` consumer.
 
 ## Guarantees
 
@@ -252,6 +294,19 @@ queue
     .publish("jobs.email", serde_json::json!({"to": "a@b.c"}), None)
     .await?;
 ```
+
+## Examples
+
+[`examples/`](examples/) has short, self-contained polyglot clients that talk
+to `nostr-q serve`'s HTTP ingress instead of linking the Rust SDK:
+
+| File | What it does |
+| --- | --- |
+| [`examples/python/publish.py`](examples/python/publish.py) | Publish via stdlib `urllib` — no pip install required. |
+| [`examples/python/worker_handler.py`](examples/python/worker_handler.py) | Stdlib `http.server` job consumer for `nostr-q worker --http`. |
+| [`examples/typescript/publish.ts`](examples/typescript/publish.ts) | Publish via Node 18+ global `fetch`. |
+
+See [`examples/README.md`](examples/README.md) for the full run-through.
 
 ## Development
 
