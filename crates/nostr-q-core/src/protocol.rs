@@ -116,9 +116,11 @@ pub fn build_claim_event(
     mid: &str,
     trace_id: &str,
     lease_expires_at: i64,
+    attempt: u32,
 ) -> Result<Event, ProtocolError> {
     let mut tags = lifecycle_tags(message_event_id, queue, mid, trace_id);
     tags.push(custom_tag("lease_exp", lease_expires_at.to_string()));
+    tags.push(custom_tag("attempt", attempt.to_string()));
     sign(
         EventBuilder::new(Kind::Custom(KIND_CLAIM), "").tags(tags),
         keys,
@@ -163,9 +165,11 @@ pub fn build_dlq_event(
     queue: &str,
     mid: &str,
     trace_id: &str,
+    attempt: u32,
     reason: &str,
 ) -> Result<Event, ProtocolError> {
     let mut tags = lifecycle_tags(message_event_id, queue, mid, trace_id);
+    tags.push(custom_tag("attempt", attempt.to_string()));
     tags.push(custom_tag("reason", reason));
     sign(
         EventBuilder::new(Kind::Custom(KIND_DLQ), "").tags(tags),
@@ -187,6 +191,7 @@ pub struct ClaimInfo {
     pub claim_event_id: EventId,
     pub created_at: i64,
     pub lease_expires_at: i64,
+    pub attempt: u32,
 }
 
 pub fn parse_claim_event(event: &Event) -> Result<ClaimInfo, ProtocolError> {
@@ -198,16 +203,30 @@ pub fn parse_claim_event(event: &Event) -> Result<ClaimInfo, ProtocolError> {
         claim_event_id: event.id,
         created_at: event.created_at.as_u64() as i64,
         lease_expires_at,
+        attempt: tag_value(event, "attempt")
+            .and_then(|a| a.parse().ok())
+            .unwrap_or(0),
     })
 }
 
-/// Deterministic claim conflict resolution: earliest created_at wins,
-/// ties broken by event id hex. Expired claims are ignored.
-pub fn claim_winner(claims: &[ClaimInfo], now: i64) -> Option<&ClaimInfo> {
+/// Deterministic claim conflict resolution. `min_attempt` is the highest
+/// attempt number seen in nack events for this message: a nack at attempt
+/// N releases every claim made for an earlier attempt, so retries don't
+/// lose to their own stale claims. Among unexpired claims with
+/// attempt >= min_attempt, earliest created_at wins, ties broken by event
+/// id hex.
+pub fn claim_winner(claims: &[ClaimInfo], min_attempt: u32, now: i64) -> Option<&ClaimInfo> {
     claims
         .iter()
-        .filter(|c| c.lease_expires_at > now)
+        .filter(|c| c.lease_expires_at > now && c.attempt >= min_attempt)
         .min_by_key(|c| (c.created_at, c.claim_event_id.to_hex()))
+}
+
+/// Attempt number carried by a nack event (0 when absent).
+pub fn event_attempt(event: &Event) -> u32 {
+    tag_value(event, "attempt")
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -264,14 +283,15 @@ mod tests {
         let keys_b = Keys::generate();
         let msg_id = nostr::EventId::all_zeros();
         let a =
-            build_claim_event(&keys_a, msg_id, "jobs.email", "m1", "t1", 2_000_000_000).unwrap();
+            build_claim_event(&keys_a, msg_id, "jobs.email", "m1", "t1", 2_000_000_000, 0).unwrap();
         let b =
-            build_claim_event(&keys_b, msg_id, "jobs.email", "m1", "t1", 2_000_000_000).unwrap();
+            build_claim_event(&keys_b, msg_id, "jobs.email", "m1", "t1", 2_000_000_000, 0).unwrap();
         let ca = parse_claim_event(&a).unwrap();
         let cb = parse_claim_event(&b).unwrap();
         assert_eq!(ca.lease_expires_at, 2_000_000_000);
+        assert_eq!(ca.attempt, 0);
         let claims = vec![ca.clone(), cb.clone()];
-        let winner = claim_winner(&claims, 0).unwrap();
+        let winner = claim_winner(&claims, 0, 0).unwrap();
         // deterministic: same-second claims break ties by event id hex
         let expect = if ca.claim_event_id.to_hex() <= cb.claim_event_id.to_hex() {
             &ca
@@ -280,7 +300,38 @@ mod tests {
         };
         assert_eq!(winner.claim_event_id, expect.claim_event_id);
         // expired claims never win
-        assert!(claim_winner(&claims, 3_000_000_000).is_none());
+        assert!(claim_winner(&claims, 0, 3_000_000_000).is_none());
+    }
+
+    #[test]
+    fn claim_winner_ignores_claims_from_before_a_nack() {
+        // Built as ClaimInfo directly (rather than via build_claim_event's
+        // wall-clock created_at) so `stale` is deterministically earlier
+        // than `retry` — build_claim_event has no way to control
+        // created_at, and two claims minted moments apart in a test
+        // usually land in the same second, making the created_at tiebreak
+        // fall through to a coin-flip on event id hex.
+        let claimer = Keys::generate().public_key();
+        let stale = ClaimInfo {
+            claimer,
+            claim_event_id: EventId::from_slice(&[0xaa; 32]).unwrap(),
+            created_at: 1_000_000_000,
+            lease_expires_at: 2_000_000_000,
+            attempt: 0,
+        };
+        let retry = ClaimInfo {
+            claimer,
+            claim_event_id: EventId::from_slice(&[0xbb; 32]).unwrap(),
+            created_at: 1_000_000_005,
+            lease_expires_at: 2_000_000_000,
+            attempt: 1,
+        };
+        let claims = vec![stale.clone(), retry.clone()];
+        // nack at attempt 1 releases the attempt-0 claim
+        let winner = claim_winner(&claims, 1, 0).unwrap();
+        assert_eq!(winner.claim_event_id, retry.claim_event_id);
+        // without the nack, the earlier claim still wins
+        assert_eq!(claim_winner(&claims, 0, 0).unwrap().attempt, 0);
     }
 
     #[test]
@@ -294,5 +345,9 @@ mod tests {
         let nack = build_nack_event(&keys, msg_id, "jobs.email", "m1", "t1", 3, "boom").unwrap();
         assert_eq!(tag_value(&nack, "attempt").as_deref(), Some("3"));
         assert_eq!(tag_value(&nack, "reason").as_deref(), Some("boom"));
+        let dlq = build_dlq_event(&keys, msg_id, "jobs.email", "m1", "t1", 4, "dead").unwrap();
+        assert_eq!(dlq.kind.as_u16(), KIND_DLQ);
+        assert_eq!(tag_value(&dlq, "attempt").as_deref(), Some("4"));
+        assert_eq!(tag_value(&dlq, "reason").as_deref(), Some("dead"));
     }
 }

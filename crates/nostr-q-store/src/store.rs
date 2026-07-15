@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS messages (
   envelope_json TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'pending', -- pending | claimed | acked | dead
   attempts INTEGER NOT NULL DEFAULT 0,
+  attempt_floor INTEGER NOT NULL DEFAULT 0,
   idem_key TEXT,
   consumer TEXT,
   lease_expires_at INTEGER,
@@ -68,6 +69,7 @@ pub struct MessageRecord {
     pub envelope_json: String,
     pub status: String,
     pub attempts: u32,
+    pub attempt_floor: u32,
     pub idem_key: Option<String>,
     pub visible_at: i64,
     pub created_at: i64,
@@ -100,8 +102,7 @@ pub struct QueueStats {
     pub oldest_pending_age_secs: Option<i64>,
 }
 
-const MSG_COLS: &str =
-    "mid, queue, event_id, trace_id, envelope_json, status, attempts, idem_key, visible_at, created_at";
+const MSG_COLS: &str = "mid, queue, event_id, trace_id, envelope_json, status, attempts, attempt_floor, idem_key, visible_at, created_at";
 
 fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRecord> {
     Ok(MessageRecord {
@@ -112,9 +113,10 @@ fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRecord> {
         envelope_json: row.get(4)?,
         status: row.get(5)?,
         attempts: row.get(6)?,
-        idem_key: row.get(7)?,
-        visible_at: row.get(8)?,
-        created_at: row.get(9)?,
+        attempt_floor: row.get(7)?,
+        idem_key: row.get(8)?,
+        visible_at: row.get(9)?,
+        created_at: row.get(10)?,
     })
 }
 
@@ -233,11 +235,11 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
             "INSERT OR IGNORE INTO messages
-               (mid, queue, event_id, trace_id, envelope_json, status, attempts, idem_key, visible_at, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+               (mid, queue, event_id, trace_id, envelope_json, status, attempts, attempt_floor, idem_key, visible_at, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             rusqlite::params![
                 rec.mid, rec.queue, rec.event_id, rec.trace_id, rec.envelope_json,
-                rec.status, rec.attempts, rec.idem_key, rec.visible_at, rec.created_at, Self::now()
+                rec.status, rec.attempts, rec.attempt_floor, rec.idem_key, rec.visible_at, rec.created_at, Self::now()
             ],
         )?;
         Ok(n == 1)
@@ -279,10 +281,28 @@ impl Store {
         Ok(())
     }
 
-    pub fn mark_claimed(&self, mid: &str, consumer: &str, lease_expires_at: i64) -> Result<()> {
+    /// Mark a message claimed by `consumer`, healing the local `attempts`
+    /// counter up to `attempt` in the process.
+    ///
+    /// The winning claim's `attempt` is the globally observed retry
+    /// generation (see `try_claim`'s `claim_attempt`), which may be ahead of
+    /// this worker's own local counter when another worker advanced the
+    /// generation first. Persisting `MAX(attempts, attempt)` here keeps this
+    /// worker's counter in sync with the generation it just won, so that if
+    /// this worker goes on to nack the message, `incr_attempts` advances the
+    /// generation forward instead of colliding with (or trailing behind) the
+    /// claim it just made.
+    pub fn mark_claimed(
+        &self,
+        mid: &str,
+        consumer: &str,
+        lease_expires_at: i64,
+        attempt: u32,
+    ) -> Result<()> {
         self.update(
-            "UPDATE messages SET status='claimed', consumer=?2, lease_expires_at=?3, updated_at=?4 WHERE mid=?1",
-            rusqlite::params![mid, consumer, lease_expires_at, Self::now()],
+            "UPDATE messages SET status='claimed', consumer=?2, lease_expires_at=?3, \
+             attempts = MAX(attempts, ?4), updated_at=?5 WHERE mid=?1",
+            rusqlite::params![mid, consumer, lease_expires_at, attempt, Self::now()],
         )
     }
 
@@ -356,10 +376,19 @@ impl Store {
         Ok(out)
     }
 
+    /// Requeue a dead-lettered message for retry.
+    ///
+    /// `attempts` is the global retry generation and must stay monotonic:
+    /// `try_claim` heals it up to the highest attempt observed across all
+    /// historical nack events on the relay (which are never deleted), so
+    /// resetting it here would just have `try_claim` heal it right back to
+    /// its pre-retry value. Instead we leave `attempts` untouched and record
+    /// an `attempt_floor` marking where the fresh DLQ budget starts; `nack`
+    /// then measures the budget as `attempts - attempt_floor`.
     pub fn dlq_retry(&self, mid: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE messages SET status='pending', attempts=0, visible_at=0, lease_expires_at=NULL, updated_at=?2 WHERE mid=?1",
+            "UPDATE messages SET status='pending', attempt_floor=attempts, visible_at=0, lease_expires_at=NULL, updated_at=?2 WHERE mid=?1",
             rusqlite::params![mid, Self::now()],
         )?;
         conn.execute("DELETE FROM dlq WHERE mid=?1", [mid])?;
@@ -498,6 +527,7 @@ mod tests {
             envelope_json: "{}".into(),
             status: "pending".into(),
             attempts: 0,
+            attempt_floor: 0,
             idem_key: None,
             visible_at: 0,
             created_at: 100,
@@ -512,12 +542,17 @@ mod tests {
 
         let claimable = store.claimable("q", 1000, 10).unwrap();
         assert_eq!(claimable.len(), 1);
-        store.mark_claimed("m1", "pubkey-a", 2000).unwrap();
+        store.mark_claimed("m1", "pubkey-a", 2000, 0).unwrap();
         assert!(store.claimable("q", 1000, 10).unwrap().is_empty()); // lease active
         assert_eq!(store.claimable("q", 2001, 10).unwrap().len(), 1); // lease expired -> reclaimable
         store.mark_acked("m1").unwrap();
         assert!(store.claimable("q", 3000, 10).unwrap().is_empty());
         assert_eq!(store.get_message("m1").unwrap().unwrap().status, "acked");
+
+        // mark_claimed heals the local attempts counter to the claim's generation
+        assert!(store.insert_message(&rec("m2", "q")).unwrap());
+        store.mark_claimed("m2", "pk", 2000, 3).unwrap();
+        assert_eq!(store.get_message("m2").unwrap().unwrap().attempts, 3);
     }
 
     #[test]
@@ -567,7 +602,11 @@ mod tests {
         assert!(store.dlq_list(None).unwrap().is_empty());
         let m = store.get_message("m1").unwrap().unwrap();
         assert_eq!(m.status, "pending");
-        assert_eq!(m.attempts, 0);
+        assert_eq!(m.attempts, 2, "attempts stays monotonic across a DLQ retry");
+        assert_eq!(
+            m.attempt_floor, 2,
+            "floor marks where the fresh budget starts"
+        );
     }
 
     #[test]
