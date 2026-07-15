@@ -1,13 +1,15 @@
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use nostr::Keys;
+use nostr::{Filter, Keys, Kind};
 use serde::Serialize;
 use serde_json::Value;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 use nostr_q_core::envelope::Envelope;
 use nostr_q_core::ids::{new_mid, new_trace_id};
-use nostr_q_core::protocol::{build_message_event, NqMessage};
+use nostr_q_core::protocol::{build_message_event, parse_message_event, NqMessage, KIND_MESSAGE};
 use nostr_q_core::queue::QueueMode;
 use nostr_q_relay::Transport;
 use nostr_q_store::{MessageRecord, Store};
@@ -104,6 +106,63 @@ impl NostrQ {
             event_id: event_id.to_hex(),
         })
     }
+
+    fn message_filter(topic: &str) -> Filter {
+        Filter::new().kind(Kind::Custom(KIND_MESSAGE)).hashtag(topic)
+    }
+
+    pub async fn subscribe(&self, topic: &str) -> Result<mpsc::Receiver<NqMessage>> {
+        let mut events = self.transport.subscribe(Self::message_filter(topic)).await?;
+        let (tx, rx) = mpsc::channel(64);
+        tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                match parse_message_event(&event) {
+                    Ok(msg) => {
+                        if tx.send(msg).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "skipping malformed nostr-q event"),
+                }
+            }
+        });
+        Ok(rx)
+    }
+
+    pub async fn spawn_ingest(&self, queue: &str) -> Result<JoinHandle<()>> {
+        let mut events = self.transport.subscribe(Self::message_filter(queue)).await?;
+        let store = self.store.clone();
+        Ok(tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                let msg = match parse_message_event(&event) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "skipping malformed nostr-q event");
+                        continue;
+                    }
+                };
+                let rec = MessageRecord {
+                    mid: msg.mid.clone(),
+                    queue: msg.queue.clone(),
+                    event_id: event.id.to_hex(),
+                    trace_id: msg.trace_id.clone(),
+                    envelope_json: msg.envelope.to_json().unwrap_or_else(|_| "{}".into()),
+                    status: "pending".to_string(),
+                    attempts: msg.attempt,
+                    idem_key: msg.idem.clone(),
+                    visible_at: 0,
+                    created_at: event.created_at.as_u64() as i64,
+                };
+                match store.insert_message(&rec) {
+                    Ok(true) => {
+                        let _ = store.record_lifecycle(&msg.mid, &msg.trace_id, "seen", &msg.queue);
+                    }
+                    Ok(false) => {} // duplicate: already published/ingested locally
+                    Err(e) => tracing::warn!(error = %e, "failed to store ingested message"),
+                }
+            }
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -178,5 +237,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(events.len(), 1, "duplicate idem must not re-broadcast");
+    }
+
+    #[tokio::test]
+    async fn subscribe_delivers_pubsub_messages() {
+        let (nq, _) = setup();
+        let mut rx = nq.subscribe("events.user.created").await.unwrap();
+        nq.publish("events.user.created", json!({"id": 7}), None).await.unwrap();
+        let msg = rx.recv().await.unwrap();
+        assert_eq!(msg.queue, "events.user.created");
+        assert_eq!(msg.envelope.body, json!({"id": 7}));
+    }
+
+    #[tokio::test]
+    async fn ingest_stores_remote_messages_as_pending() {
+        // producer and worker share a transport but have separate stores/keys
+        let transport = Arc::new(MockTransport::new());
+        let mk = |t: Arc<MockTransport>| {
+            let store = Arc::new(Store::open_in_memory().unwrap());
+            store.upsert_queue(&QueueConfig::work_queue("jobs.email")).unwrap();
+            NostrQ::new(Keys::generate(), store, t)
+        };
+        let producer = mk(transport.clone());
+        let worker = mk(transport.clone());
+
+        let _ingest = worker.spawn_ingest("jobs.email").await.unwrap();
+        let receipt = producer.publish("jobs.email", json!({"n": 1}), None).await.unwrap();
+
+        // poll until the ingest task lands the row (max ~2s)
+        let mut found = None;
+        for _ in 0..40 {
+            if let Some(rec) = worker.store().get_message(&receipt.mid).unwrap() {
+                found = Some(rec);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let rec = found.expect("ingest should store the remote message");
+        assert_eq!(rec.status, "pending");
+        assert_eq!(rec.event_id, receipt.event_id);
     }
 }
