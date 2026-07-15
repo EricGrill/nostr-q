@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
+use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -25,6 +26,16 @@ pub enum Encryption {
     Nip44,
 }
 
+/// Error returned when a queue enum's `FromStr` impl is given a value it
+/// doesn't recognize. Carries the offending value and the target type name
+/// so callers (e.g. the CLI) can render a useful message.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("invalid value '{value}' for {type_name}")]
+pub struct ParseEnumError {
+    pub value: String,
+    pub type_name: &'static str,
+}
+
 macro_rules! str_enum {
     ($ty:ty { $($variant:path => $s:literal),+ $(,)? }) => {
         impl $ty {
@@ -33,11 +44,14 @@ macro_rules! str_enum {
             }
         }
         impl FromStr for $ty {
-            type Err = String;
+            type Err = ParseEnumError;
             fn from_str(s: &str) -> Result<Self, Self::Err> {
                 match s {
                     $($s => Ok($variant),)+
-                    other => Err(format!("invalid value '{other}' for {}", stringify!($ty))),
+                    other => Err(ParseEnumError {
+                        value: other.to_string(),
+                        type_name: stringify!($ty),
+                    }),
                 }
             }
         }
@@ -138,6 +152,17 @@ mod tests {
         );
         assert!(QueueMode::from_str("bogus").is_err());
         assert_eq!(QueueMode::WorkQueue.as_str(), "work_queue");
+    }
+
+    #[test]
+    fn from_str_error_is_typed_and_carries_offending_value() {
+        let err = QueueMode::from_str("bogus").unwrap_err();
+        assert_eq!(err.value, "bogus");
+        assert_eq!(err.type_name, "QueueMode");
+        assert_eq!(err.to_string(), "invalid value 'bogus' for QueueMode");
+        // it's a real std::error::Error, so it composes with anyhow via `?`
+        let as_std: &dyn std::error::Error = &err;
+        assert!(as_std.to_string().contains("bogus"));
     }
 
     #[test]

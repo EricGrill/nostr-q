@@ -1,9 +1,15 @@
 use std::process::Stdio;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
 
 use crate::{Handler, HandlerOutcome, JobContext};
+
+/// Default request timeout for `HttpHandler::new` — protects direct SDK
+/// users of `HttpHandler` from a hung endpoint blocking a job forever, even
+/// outside `run_worker`'s lease-timeout safety net.
+const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Runs `sh -c <command>` with the payload JSON on stdin and job metadata
 /// in NQ_* environment variables. Exit 0 => ack, anything else => nack.
@@ -21,6 +27,7 @@ impl Handler for ExecHandler {
             .env("NQ_QUEUE", &job.queue)
             .env("NQ_TRACE", &job.trace_id)
             .env("NQ_ATTEMPT", job.attempt.to_string())
+            .env("NQ_GENERATION", job.generation.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -77,11 +84,21 @@ pub struct HttpHandler {
 }
 
 impl HttpHandler {
+    /// Uses `DEFAULT_HTTP_TIMEOUT` (30s) as the request timeout.
     pub fn new(url: String) -> Self {
-        Self {
-            url,
-            client: reqwest::Client::new(),
-        }
+        Self::with_timeout(url, DEFAULT_HTTP_TIMEOUT)
+    }
+
+    /// Like `new`, but with a caller-supplied request timeout so a hung
+    /// endpoint can't block a job past this bound, even when `HttpHandler`
+    /// is used directly (not via `run_worker`, which has its own lease
+    /// timeout).
+    pub fn with_timeout(url: String, timeout: Duration) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(timeout)
+            .build()
+            .expect("failed to build reqwest client");
+        Self { url, client }
     }
 }
 
@@ -93,6 +110,7 @@ impl Handler for HttpHandler {
             "queue": job.queue,
             "trace": job.trace_id,
             "attempt": job.attempt,
+            "generation": job.generation,
             "idem": job.idem,
             "payload": job.payload,
         });

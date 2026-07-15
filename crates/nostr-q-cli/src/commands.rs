@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use nostr_q::queue::{Delivery, QueueConfig, QueueMode};
 use nostr_q::relay::{NostrTransport, Transport};
-use nostr_q::store_crate::Store;
+use nostr_q::store::Store;
 use nostr_q::NostrQ;
 use nostr_q_worker::{handlers::ExecHandler, run_worker, Handler, WorkerOptions};
 use tokio_util::sync::CancellationToken;
@@ -178,13 +178,13 @@ pub fn queue_create(
     max_attempts: Option<u32>,
     lease: Option<u64>,
 ) -> Result<()> {
-    let mode = QueueMode::from_str(mode).map_err(anyhow::Error::msg)?;
+    let mode = QueueMode::from_str(mode)?;
     let mut q = match mode {
         QueueMode::WorkQueue => QueueConfig::work_queue(name),
         QueueMode::Pubsub => QueueConfig::pubsub(name),
     };
     if let Some(d) = delivery {
-        q.delivery = Delivery::from_str(&d).map_err(anyhow::Error::msg)?;
+        q.delivery = Delivery::from_str(&d)?;
     }
     if let Some(m) = max_attempts {
         q.max_attempts = m;
