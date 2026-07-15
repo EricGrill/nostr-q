@@ -4,10 +4,10 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use nostr_q::queue::{Delivery, QueueConfig, QueueMode};
 use nostr_q::relay::{NostrTransport, Transport};
 use nostr_q::store_crate::Store;
 use nostr_q::NostrQ;
-use nostr_q::queue::{Delivery, QueueConfig, QueueMode};
 use nostr_q_worker::{handlers::ExecHandler, run_worker, Handler, WorkerOptions};
 use tokio_util::sync::CancellationToken;
 
@@ -26,7 +26,11 @@ impl Ctx {
         let path = config_path.unwrap_or_else(config::default_config_path);
         let cfg = Config::load(&path)?;
         let store = Arc::new(Store::open(&cfg.state_path())?);
-        Ok(Self { config: cfg, store, json })
+        Ok(Self {
+            config: cfg,
+            store,
+            json,
+        })
     }
 
     pub async fn connect(&self) -> Result<NostrQ> {
@@ -69,7 +73,10 @@ pub fn key_generate(ctx: &Ctx) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     }
-    println!("wrote key file {} (private key not displayed)", path.display());
+    println!(
+        "wrote key file {} (private key not displayed)",
+        path.display()
+    );
     println!("public key: {}", keys.public_key());
     Ok(())
 }
@@ -153,7 +160,12 @@ pub fn queue_create(
         q.lease_seconds = l;
     }
     ctx.store.upsert_queue(&q)?;
-    println!("created queue '{}' mode={} delivery={}", q.name, q.mode.as_str(), q.delivery.as_str());
+    println!(
+        "created queue '{}' mode={} delivery={}",
+        q.name,
+        q.mode.as_str(),
+        q.delivery.as_str()
+    );
     Ok(())
 }
 
@@ -167,7 +179,11 @@ pub fn queue_list(ctx: &Ctx) -> Result<()> {
         for q in queues {
             println!(
                 "{:<30} {:<11} {:<14} max_attempts={} lease={}s",
-                q.name, q.mode.as_str(), q.delivery.as_str(), q.max_attempts, q.lease_seconds
+                q.name,
+                q.mode.as_str(),
+                q.delivery.as_str(),
+                q.max_attempts,
+                q.lease_seconds
             );
         }
     }
@@ -195,7 +211,10 @@ pub async fn publish(
     if ctx.json {
         println!("{}", serde_json::to_string(&receipt)?);
     } else {
-        println!("published mid={} trace={} event={}", receipt.mid, receipt.trace_id, receipt.event_id);
+        println!(
+            "published mid={} trace={} event={}",
+            receipt.mid, receipt.trace_id, receipt.event_id
+        );
     }
     Ok(())
 }
@@ -221,7 +240,7 @@ pub async fn worker(
     }
     let handler: Arc<dyn Handler> = match (exec, http) {
         (Some(command), None) => Arc::new(ExecHandler { command }),
-        (None, Some(_url)) => anyhow::bail!("--http is implemented in the next task"),
+        (None, Some(url)) => Arc::new(nostr_q_worker::handlers::HttpHandler::new(url)),
         _ => anyhow::bail!("provide exactly one of --exec or --http"),
     };
     let nq = Arc::new(ctx.connect().await?);

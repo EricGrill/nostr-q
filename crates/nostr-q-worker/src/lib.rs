@@ -343,4 +343,32 @@ mod tests {
         handle.await.unwrap().unwrap();
         assert!(nacked, "timed-out handler must be nacked");
     }
+
+    #[tokio::test]
+    async fn http_handler_acks_on_2xx_and_nacks_on_500() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/jobs/ok"))
+            .and(body_partial_json(serde_json::json!({"mid": "m1", "payload": {"n": 1}})))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/jobs/fail"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let ok = crate::handlers::HttpHandler::new(format!("{}/jobs/ok", server.uri()));
+        assert!(matches!(ok.handle(&job()).await, HandlerOutcome::Success));
+
+        let fail = crate::handlers::HttpHandler::new(format!("{}/jobs/fail", server.uri()));
+        match fail.handle(&job()).await {
+            HandlerOutcome::Failure(reason) => assert!(reason.contains("500"), "{reason}"),
+            HandlerOutcome::Success => panic!("expected failure"),
+        }
+    }
 }

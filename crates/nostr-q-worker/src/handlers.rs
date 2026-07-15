@@ -52,3 +52,34 @@ impl Handler for ExecHandler {
         }
     }
 }
+
+/// POSTs job JSON to an HTTP endpoint. 2xx response => ack, else nack.
+pub struct HttpHandler {
+    url: String,
+    client: reqwest::Client,
+}
+
+impl HttpHandler {
+    pub fn new(url: String) -> Self {
+        Self { url, client: reqwest::Client::new() }
+    }
+}
+
+#[async_trait]
+impl Handler for HttpHandler {
+    async fn handle(&self, job: &JobContext) -> HandlerOutcome {
+        let body = serde_json::json!({
+            "mid": job.mid,
+            "queue": job.queue,
+            "trace": job.trace_id,
+            "attempt": job.attempt,
+            "idem": job.idem,
+            "payload": job.payload,
+        });
+        match self.client.post(&self.url).json(&body).send().await {
+            Ok(resp) if resp.status().is_success() => HandlerOutcome::Success,
+            Ok(resp) => HandlerOutcome::Failure(format!("http status {}", resp.status())),
+            Err(e) => HandlerOutcome::Failure(format!("http request failed: {e}")),
+        }
+    }
+}
