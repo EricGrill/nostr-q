@@ -165,6 +165,7 @@ impl NostrQ {
             visible_at: opts.not_before.unwrap_or(0),
             expires_at: opts.expires_at,
             created_at: Self::now(),
+            reply_to: msg.reply_to.clone(),
         };
         let inserted = self.store.insert_message(&rec)?;
         if !inserted {
@@ -578,23 +579,6 @@ impl NostrQ {
         Ok(())
     }
 
-    /// Look up whether the message published as `request_event_id` is an
-    /// RPC request, returning its `reply` tag (the requester's pubkey hex)
-    /// if so. `None` when the event can't be found or carries no `reply`
-    /// tag. Lets a responder that only has a message's event id (e.g. from
-    /// a `MessageRecord`, which doesn't persist `reply_to`) recover the
-    /// requester to reply to.
-    pub async fn request_reply_to(&self, request_event_id: EventId) -> Result<Option<String>> {
-        let events = self
-            .transport
-            .query(Filter::new().id(request_event_id))
-            .await?;
-        Ok(events
-            .first()
-            .and_then(|e| parse_message_event(e).ok())
-            .and_then(|m| m.reply_to))
-    }
-
     pub async fn subscribe(&self, topic: &str) -> Result<mpsc::Receiver<NqMessage>> {
         let mut events = self
             .transport
@@ -696,6 +680,7 @@ impl NostrQ {
                     visible_at: msg.not_before.unwrap_or(0),
                     expires_at: msg.expires_at,
                     created_at: event_created_at,
+                    reply_to: msg.reply_to.clone(),
                 };
                 match store.insert_message(&rec) {
                     Ok(true) => {
@@ -1591,7 +1576,7 @@ mod tests {
                     let Ok(request_event_id) = EventId::from_hex(&rec.event_id) else {
                         continue;
                     };
-                    if let Ok(Some(reply_to)) = server.request_reply_to(request_event_id).await {
+                    if let Some(reply_to) = rec.reply_to.clone() {
                         let body = Envelope::from_json(&rec.envelope_json)
                             .map(|e| e.body)
                             .unwrap_or(Value::Null);
@@ -1681,13 +1666,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_reply_to_returns_none_for_non_rpc_message() {
+    async fn publish_records_reply_to_none_for_ordinary_publish() {
         let (nq, _) = setup();
         let receipt = nq
             .publish("jobs.email", json!({"n": 1}), None)
             .await
             .unwrap();
-        let event_id = EventId::from_hex(&receipt.event_id).unwrap();
-        assert_eq!(nq.request_reply_to(event_id).await.unwrap(), None);
+        let rec = nq.store().get_message(&receipt.mid).unwrap().unwrap();
+        assert_eq!(rec.reply_to, None);
+    }
+
+    #[tokio::test]
+    async fn call_records_reply_to_on_the_request_row() {
+        // `call` has no responder here, so it times out — but the request
+        // row it published must still carry `reply_to` (this node's own
+        // pubkey) so a worker elsewhere can gate its reply path locally
+        // without a transport query (CHA-2348).
+        let (nq, _) = setup();
+        let our_pubkey = nq.keys().public_key().to_hex();
+        let err = nq
+            .call(
+                "jobs.email",
+                json!({"n": 1}),
+                std::time::Duration::from_millis(50),
+            )
+            .await
+            .expect_err("no responder, call must time out");
+        assert!(err.to_string().contains("no reply"), "{err}");
+
+        let rows = nq.store().claimable("jobs.email", i64::MAX, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].reply_to.as_deref(), Some(our_pubkey.as_str()));
     }
 }

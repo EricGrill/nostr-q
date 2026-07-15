@@ -1588,6 +1588,7 @@ mod tests {
             visible_at: 0,
             expires_at: None,
             created_at: 0,
+            reply_to: None,
         };
         ctx.store.insert_message(&rec).unwrap();
         ctx.store.move_to_dlq("m1", "boom").unwrap();
