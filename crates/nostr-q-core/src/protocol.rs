@@ -278,6 +278,96 @@ mod tests {
     }
 
     #[test]
+    fn parse_message_event_rejects_missing_t_tag() {
+        let keys = Keys::generate();
+        let content = Envelope::new(json!({})).to_json().unwrap();
+        // mid + trace present, but no "t" (queue) tag.
+        let tags = vec![
+            custom_tag("mid", crate::ids::new_mid()),
+            custom_tag("trace", crate::ids::new_trace_id()),
+        ];
+        let event = nostr::EventBuilder::new(nostr::Kind::Custom(KIND_MESSAGE), content)
+            .tags(tags)
+            .sign_with_keys(&keys)
+            .unwrap();
+        assert!(matches!(
+            parse_message_event(&event),
+            Err(ProtocolError::MissingTag(tag)) if tag == "t"
+        ));
+    }
+
+    #[test]
+    fn parse_message_event_rejects_missing_trace_tag() {
+        let keys = Keys::generate();
+        let content = Envelope::new(json!({})).to_json().unwrap();
+        // mid + t present, but no "trace" tag.
+        let tags = vec![
+            custom_tag("mid", crate::ids::new_mid()),
+            Tag::hashtag("jobs.email"),
+        ];
+        let event = nostr::EventBuilder::new(nostr::Kind::Custom(KIND_MESSAGE), content)
+            .tags(tags)
+            .sign_with_keys(&keys)
+            .unwrap();
+        assert!(matches!(
+            parse_message_event(&event),
+            Err(ProtocolError::MissingTag(tag)) if tag == "trace"
+        ));
+    }
+
+    #[test]
+    fn parse_message_event_rejects_malformed_envelope_content() {
+        let keys = Keys::generate();
+        // valid nostr-q tags, but content is not a valid Envelope JSON.
+        let tags = vec![
+            custom_tag("mid", crate::ids::new_mid()),
+            Tag::hashtag("jobs.email"),
+            custom_tag("trace", crate::ids::new_trace_id()),
+        ];
+        let event =
+            nostr::EventBuilder::new(nostr::Kind::Custom(KIND_MESSAGE), "not valid json at all")
+                .tags(tags)
+                .sign_with_keys(&keys)
+                .unwrap();
+        assert!(matches!(
+            parse_message_event(&event),
+            Err(ProtocolError::BadPayload(_))
+        ));
+    }
+
+    #[test]
+    fn parse_claim_event_rejects_non_integer_lease_exp() {
+        let keys = Keys::generate();
+        let msg_id = nostr::EventId::all_zeros();
+        let mut tags = lifecycle_tags(msg_id, "jobs.email", "m1", "t1");
+        tags.push(custom_tag("lease_exp", "not-a-number"));
+        let event = nostr::EventBuilder::new(nostr::Kind::Custom(KIND_CLAIM), "")
+            .tags(tags)
+            .sign_with_keys(&keys)
+            .unwrap();
+        assert!(matches!(
+            parse_claim_event(&event),
+            Err(ProtocolError::BadPayload(_))
+        ));
+    }
+
+    #[test]
+    fn parse_claim_event_rejects_missing_lease_exp() {
+        let keys = Keys::generate();
+        let msg_id = nostr::EventId::all_zeros();
+        // lifecycle tags only — no lease_exp tag at all.
+        let tags = lifecycle_tags(msg_id, "jobs.email", "m1", "t1");
+        let event = nostr::EventBuilder::new(nostr::Kind::Custom(KIND_CLAIM), "")
+            .tags(tags)
+            .sign_with_keys(&keys)
+            .unwrap();
+        assert!(matches!(
+            parse_claim_event(&event),
+            Err(ProtocolError::MissingTag(tag)) if tag == "lease_exp"
+        ));
+    }
+
+    #[test]
     fn claim_roundtrip_and_winner() {
         let keys_a = Keys::generate();
         let keys_b = Keys::generate();

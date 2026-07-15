@@ -56,6 +56,44 @@ pub fn init(config_path: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// Create `path` with mode 0600 atomically and write `contents` to it.
+///
+/// Using `create_new` means the file is created (and its permission bits
+/// fixed at 0600) in a single syscall — there is no window, as there was
+/// with write-then-chmod, where the file briefly exists with umask-derived
+/// (often world/group readable) permissions. `create_new` also gives us the
+/// "refuse to overwrite an existing key file" behavior for free: it errors
+/// if the file already exists.
+#[cfg(unix)]
+fn write_new_file_mode_0600(path: &std::path::Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("failed to create key file at {}", path.display()))?;
+    file.write_all(contents.as_bytes())?;
+    Ok(())
+}
+
+/// Portable fallback for non-unix targets: no chmod support, but
+/// `create_new` still refuses to overwrite an existing file.
+#[cfg(not(unix))]
+fn write_new_file_mode_0600(path: &std::path::Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("failed to create key file at {}", path.display()))?;
+    file.write_all(contents.as_bytes())?;
+    Ok(())
+}
+
 pub fn key_generate(ctx: &Ctx) -> Result<()> {
     let path = ctx.config.key_path();
     anyhow::ensure!(
@@ -67,12 +105,7 @@ pub fn key_generate(ctx: &Ctx) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&path, keys.secret_key().to_secret_hex())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    }
+    write_new_file_mode_0600(&path, &keys.secret_key().to_secret_hex())?;
     println!(
         "wrote key file {} (private key not displayed)",
         path.display()
@@ -358,4 +391,61 @@ pub fn dlq_retry_cmd(ctx: &Ctx, mid: &str) -> Result<()> {
         .record_lifecycle(mid, &rec.trace_id, "dlq_retried", "manual retry via cli")?;
     println!("requeued {mid} on '{}'", rec.queue);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_ctx(key_file: PathBuf) -> Ctx {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        Ctx {
+            config: Config {
+                state: "unused".into(),
+                key_file: key_file.to_string_lossy().into_owned(),
+            },
+            store,
+            json: false,
+        }
+    }
+
+    #[test]
+    fn key_generate_writes_key_file_mode_0600() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("key");
+        let ctx = test_ctx(key_path.clone());
+
+        key_generate(&ctx).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&key_path).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "key file must be created with mode 0600, got {mode:o}"
+            );
+        }
+
+        // sanity: the file holds a parseable secret key.
+        let raw = std::fs::read_to_string(&key_path).unwrap();
+        assert!(nostr::Keys::parse(raw.trim()).is_ok());
+    }
+
+    #[test]
+    fn key_generate_refuses_to_overwrite_existing_key_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("key");
+        let ctx = test_ctx(key_path.clone());
+
+        key_generate(&ctx).unwrap();
+        let original = std::fs::read_to_string(&key_path).unwrap();
+
+        let err = key_generate(&ctx).expect_err("must refuse to overwrite an existing key file");
+        assert!(err.to_string().contains("already exists"));
+
+        // the original key must be untouched.
+        assert_eq!(std::fs::read_to_string(&key_path).unwrap(), original);
+    }
 }

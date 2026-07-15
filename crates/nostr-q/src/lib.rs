@@ -429,6 +429,23 @@ impl NostrQ {
                         continue;
                     }
                 };
+                // SRS §18.5: tolerate moderate clock skew between publisher
+                // and ingester, but warn loudly on large skew (a relay's
+                // event `created_at` is publisher-supplied and untrusted) so
+                // operators can spot a misbehaving clock or relay without
+                // rejecting/dropping the message.
+                let event_created_at = event.created_at.as_secs() as i64;
+                let skew_secs = Self::now() - event_created_at;
+                const CLOCK_SKEW_WARN_THRESHOLD_SECS: i64 = 300;
+                if skew_secs.abs() > CLOCK_SKEW_WARN_THRESHOLD_SECS {
+                    tracing::warn!(
+                        mid = %msg.mid,
+                        skew_secs,
+                        "ingested event created_at is more than {CLOCK_SKEW_WARN_THRESHOLD_SECS}s \
+                         out of sync with local clock"
+                    );
+                }
+
                 let rec = MessageRecord {
                     mid: msg.mid.clone(),
                     queue: msg.queue.clone(),
@@ -440,7 +457,7 @@ impl NostrQ {
                     attempt_floor: 0,
                     idem_key: msg.idem.clone(),
                     visible_at: 0,
-                    created_at: event.created_at.as_secs() as i64,
+                    created_at: event_created_at,
                 };
                 match store.insert_message(&rec) {
                     Ok(true) => {
