@@ -362,24 +362,7 @@ pub async fn publish(
         (Some(_), Some(_)) => unreachable!("checked above"),
     };
 
-    let raw = match payload {
-        Some(p) => p,
-        None => {
-            // Reading stdin is a blocking syscall; run it on a blocking
-            // thread so it doesn't stall the async runtime (and any other
-            // tasks, like the heartbeat loop, sharing it) while waiting on
-            // input.
-            tokio::task::spawn_blocking(|| -> Result<String> {
-                let mut s = String::new();
-                std::io::stdin().read_to_string(&mut s)?;
-                Ok(s)
-            })
-            .await
-            .context("stdin read task panicked")??
-        }
-    };
-    let body: serde_json::Value =
-        serde_json::from_str(&raw).context("payload must be valid JSON")?;
+    let body = read_json_payload(payload).await?;
     let nq = ctx.connect().await?;
     let receipt = nq
         .publish_opts(
@@ -399,6 +382,51 @@ pub async fn publish(
             "published mid={} trace={} event={}",
             receipt.mid, receipt.trace_id, receipt.event_id
         );
+    }
+    Ok(())
+}
+
+/// Read a JSON payload from `payload` if given, else from stdin. Shared by
+/// `publish` and `call`.
+async fn read_json_payload(payload: Option<String>) -> Result<serde_json::Value> {
+    let raw = match payload {
+        Some(p) => p,
+        None => {
+            // Reading stdin is a blocking syscall; run it on a blocking
+            // thread so it doesn't stall the async runtime (and any other
+            // tasks, like the heartbeat loop, sharing it) while waiting on
+            // input.
+            tokio::task::spawn_blocking(|| -> Result<String> {
+                let mut s = String::new();
+                std::io::stdin().read_to_string(&mut s)?;
+                Ok(s)
+            })
+            .await
+            .context("stdin read task panicked")??
+        }
+    };
+    serde_json::from_str(&raw).context("payload must be valid JSON")
+}
+
+/// `nostr-q call <queue> <payload> [--timeout secs]` — request/reply RPC
+/// (CHA-2347): publish a request on `queue` and block for a single
+/// correlated reply, printing its JSON body. A timed-out call surfaces as a
+/// non-zero exit via the propagated error.
+pub async fn call_cmd(
+    ctx: &Ctx,
+    queue: &str,
+    payload: Option<String>,
+    timeout_secs: u64,
+) -> Result<()> {
+    let body = read_json_payload(payload).await?;
+    let nq = ctx.connect().await?;
+    let reply = nq
+        .call(queue, body, std::time::Duration::from_secs(timeout_secs))
+        .await?;
+    if ctx.json {
+        println!("{}", serde_json::to_string(&reply)?);
+    } else {
+        println!("{}", serde_json::to_string_pretty(&reply)?);
     }
     Ok(())
 }
@@ -1276,6 +1304,18 @@ mod tests {
         )
         .await
         .expect_err("non-JSON payload must be rejected before connecting to any relay");
+        assert!(err.to_string().contains("JSON"), "{err}");
+    }
+
+    // --- `nostr-q call` — request/reply RPC (CHA-2347) ---
+
+    #[tokio::test]
+    async fn call_cmd_rejects_non_json_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path().join("key"));
+        let err = call_cmd(&ctx, "q", Some("not json".into()), 30)
+            .await
+            .expect_err("non-JSON payload must be rejected before connecting to any relay");
         assert!(err.to_string().contains("JSON"), "{err}");
     }
 

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use nostr::{EventId, Filter, Keys, Kind};
+use nostr::{EventId, Filter, Keys, Kind, PublicKey};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -11,8 +11,9 @@ use nostr_q_core::envelope::Envelope;
 use nostr_q_core::ids::{new_mid, new_trace_id};
 use nostr_q_core::protocol::{
     build_ack_event, build_claim_event, build_dlq_event, build_message_event, build_nack_event,
-    claim_winner, event_attempt, parse_claim_event, parse_message_event, ClaimInfo, NqMessage,
-    KIND_ACK, KIND_CLAIM, KIND_DLQ, KIND_MESSAGE, KIND_NACK,
+    build_reply_event, claim_winner, event_attempt, parse_claim_event, parse_message_event,
+    parse_reply_event, ClaimInfo, NqMessage, KIND_ACK, KIND_CLAIM, KIND_DLQ, KIND_MESSAGE,
+    KIND_NACK, KIND_REPLY,
 };
 use nostr_q_core::queue::{QueueConfig, QueueMode};
 use nostr_q_relay::Transport;
@@ -101,6 +102,23 @@ impl NostrQ {
         idem: Option<String>,
         opts: PublishOptions,
     ) -> Result<PublishReceipt> {
+        self.publish_internal(queue, body, idem, opts, None).await
+    }
+
+    /// Shared implementation behind `publish`/`publish_opts` (which always
+    /// pass `reply_to: None`) and `call` (which sets `reply_to` to the
+    /// caller's own pubkey so a responder knows where to address its
+    /// reply). Keeping this private preserves `publish`/`publish_opts`'s
+    /// existing public behavior exactly — they can never accidentally mark
+    /// a message as an RPC request.
+    async fn publish_internal(
+        &self,
+        queue: &str,
+        body: Value,
+        idem: Option<String>,
+        opts: PublishOptions,
+        reply_to: Option<String>,
+    ) -> Result<PublishReceipt> {
         let config = self.store.get_queue(queue)?.ok_or_else(|| {
             anyhow!("unknown queue '{queue}' - create it with `nostr-q queue create {queue}`")
         })?;
@@ -124,6 +142,7 @@ impl NostrQ {
             envelope: Envelope::new(body),
             not_before: opts.not_before,
             expires_at: opts.expires_at,
+            reply_to,
         };
         let event = build_message_event(&self.keys, config.mode, &msg)?;
         let event_id = self.transport.publish(event).await?;
@@ -472,6 +491,108 @@ impl NostrQ {
                 visible_at,
             })
         }
+    }
+
+    /// Request/reply RPC: publish `body` to `queue` as a request (tagged
+    /// with this node's pubkey via the `reply` tag) and wait up to
+    /// `timeout` for a single correlated `KIND_REPLY` event, returning its
+    /// body.
+    ///
+    /// A `KIND_REPLY` subscription is opened (filtered on the request's own
+    /// event id) immediately after the request is published, and a direct
+    /// `query` is issued right after that to catch a reply that a real
+    /// relay may have already delivered in the gap between publish and
+    /// subscribe — `MockTransport`'s subscribe already replays stored
+    /// events so this is redundant there, but it's what makes `call` safe
+    /// against a real `NostrTransport`. Only the first matching reply is
+    /// used; duplicates (e.g. a worker's own retried publish) are ignored.
+    pub async fn call(
+        &self,
+        queue: &str,
+        body: Value,
+        timeout: std::time::Duration,
+    ) -> Result<Value> {
+        let requester = self.keys.public_key().to_hex();
+        let receipt = self
+            .publish_internal(
+                queue,
+                body,
+                None,
+                PublishOptions::default(),
+                Some(requester),
+            )
+            .await?;
+        let request_event_id = EventId::from_hex(&receipt.event_id)?;
+        let filter = Filter::new()
+            .kind(Kind::Custom(KIND_REPLY))
+            .event(request_event_id);
+        let mut rx = self.transport.subscribe(filter.clone()).await?;
+
+        let wait_for_reply = async {
+            // Catch a reply that landed on the relay before our subscribe
+            // call above took effect.
+            if let Ok(existing) = self.transport.query(filter.clone()).await {
+                for event in existing {
+                    if let Ok(info) = parse_reply_event(&event) {
+                        return Ok(info.body);
+                    }
+                }
+            }
+            while let Some(event) = rx.recv().await {
+                if let Ok(info) = parse_reply_event(&event) {
+                    return Ok(info.body);
+                }
+            }
+            Err(anyhow!(
+                "reply subscription closed before any reply for request '{}'",
+                receipt.mid
+            ))
+        };
+
+        match tokio::time::timeout(timeout, wait_for_reply).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!(
+                "no reply for request '{}' within {:?}",
+                receipt.mid,
+                timeout
+            )),
+        }
+    }
+
+    /// Publish a `KIND_REPLY` event correlated to `request_event_id`,
+    /// addressed to `requester_pubkey_hex` (the value carried in the
+    /// original request's `reply` tag). Used by RPC responders (typically
+    /// `nostr-q-worker::run_worker`) after successfully handling a request
+    /// that asked for a reply.
+    pub async fn publish_reply(
+        &self,
+        requester_pubkey_hex: &str,
+        request_event_id: EventId,
+        request_mid: &str,
+        body: Value,
+    ) -> Result<()> {
+        let requester = PublicKey::from_hex(requester_pubkey_hex)
+            .map_err(|e| anyhow!("invalid requester pubkey '{requester_pubkey_hex}': {e}"))?;
+        let event = build_reply_event(&self.keys, request_event_id, request_mid, requester, &body)?;
+        self.transport.publish(event).await?;
+        Ok(())
+    }
+
+    /// Look up whether the message published as `request_event_id` is an
+    /// RPC request, returning its `reply` tag (the requester's pubkey hex)
+    /// if so. `None` when the event can't be found or carries no `reply`
+    /// tag. Lets a responder that only has a message's event id (e.g. from
+    /// a `MessageRecord`, which doesn't persist `reply_to`) recover the
+    /// requester to reply to.
+    pub async fn request_reply_to(&self, request_event_id: EventId) -> Result<Option<String>> {
+        let events = self
+            .transport
+            .query(Filter::new().id(request_event_id))
+            .await?;
+        Ok(events
+            .first()
+            .and_then(|e| parse_message_event(e).ok())
+            .and_then(|m| m.reply_to))
     }
 
     pub async fn subscribe(&self, topic: &str) -> Result<mpsc::Receiver<NqMessage>> {
@@ -1443,5 +1564,130 @@ mod tests {
             1,
             "no duplicate claim published for an already-held message"
         );
+    }
+
+    // --- request/reply RPC (CHA-2347) ---
+
+    fn mk_rpc(t: Arc<MockTransport>) -> NostrQ {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        store
+            .upsert_queue(&QueueConfig::work_queue("rpc.echo"))
+            .unwrap();
+        NostrQ::new(Keys::generate(), store, t)
+    }
+
+    /// Minimal RPC "server": ingests requests on `queue`, and for each one
+    /// (identified by having a `reply_to`) publishes an echoed reply and
+    /// marks the local row acked so it isn't replied to twice. Mirrors what
+    /// `nostr-q-worker::run_worker` does internally, but standalone so the
+    /// SDK's `call`/`publish_reply` pair can be exercised without pulling
+    /// in the worker crate.
+    fn spawn_echo_server(server: Arc<NostrQ>, queue: &'static str) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                let now = chrono::Utc::now().timestamp();
+                let batch = server.store().claimable(queue, now, 10).unwrap_or_default();
+                for rec in batch {
+                    let Ok(request_event_id) = EventId::from_hex(&rec.event_id) else {
+                        continue;
+                    };
+                    if let Ok(Some(reply_to)) = server.request_reply_to(request_event_id).await {
+                        let body = Envelope::from_json(&rec.envelope_json)
+                            .map(|e| e.body)
+                            .unwrap_or(Value::Null);
+                        let reply_body = json!({"echo": body});
+                        let _ = server
+                            .publish_reply(&reply_to, request_event_id, &rec.mid, reply_body)
+                            .await;
+                    }
+                    // whether or not it was an RPC request, mark it settled
+                    // so this loop doesn't keep reprocessing it.
+                    let _ = server.store().mark_acked(&rec.mid);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn call_receives_reply_from_server_via_publish_reply() {
+        let transport = Arc::new(MockTransport::new());
+        let caller = mk_rpc(transport.clone());
+        let server = Arc::new(mk_rpc(transport.clone()));
+        let _ingest = server.spawn_ingest("rpc.echo").await.unwrap();
+        let _server_task = spawn_echo_server(server.clone(), "rpc.echo");
+
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            caller.call(
+                "rpc.echo",
+                json!({"n": 1}),
+                std::time::Duration::from_secs(5),
+            ),
+        )
+        .await
+        .expect("call should not hang")
+        .expect("call should receive a reply");
+
+        assert_eq!(reply, json!({"echo": {"n": 1}}));
+    }
+
+    #[tokio::test]
+    async fn call_times_out_when_no_responder() {
+        let transport = Arc::new(MockTransport::new());
+        let caller = mk_rpc(transport.clone());
+        // no server/ingest running — nothing will ever reply.
+        let err = caller
+            .call(
+                "rpc.echo",
+                json!({"n": 1}),
+                std::time::Duration::from_millis(200),
+            )
+            .await
+            .expect_err("call must time out when no reply arrives");
+        assert!(err.to_string().contains("no reply"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn publish_reply_errors_are_isolated_from_call_dedup() {
+        // A second, duplicate reply published after the first must not
+        // change the outcome observed by `call` (it already returned on the
+        // first match) — this just proves publish_reply itself is a plain,
+        // repeatable publish with no dedup logic of its own.
+        let transport = Arc::new(MockTransport::new());
+        let server = mk_rpc(transport.clone());
+        let receipt = server
+            .publish("rpc.echo", json!({"n": 1}), None)
+            .await
+            .unwrap();
+        let request_event_id = EventId::from_hex(&receipt.event_id).unwrap();
+        let requester = Keys::generate().public_key().to_hex();
+        server
+            .publish_reply(
+                &requester,
+                request_event_id,
+                &receipt.mid,
+                json!({"ok": true}),
+            )
+            .await
+            .unwrap();
+        let replies = transport
+            .query(
+                nostr::Filter::new().kind(nostr::Kind::Custom(nostr_q_core::protocol::KIND_REPLY)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replies.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn request_reply_to_returns_none_for_non_rpc_message() {
+        let (nq, _) = setup();
+        let receipt = nq
+            .publish("jobs.email", json!({"n": 1}), None)
+            .await
+            .unwrap();
+        let event_id = EventId::from_hex(&receipt.event_id).unwrap();
+        assert_eq!(nq.request_reply_to(event_id).await.unwrap(), None);
     }
 }

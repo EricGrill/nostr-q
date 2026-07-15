@@ -67,6 +67,16 @@ enum Cmd {
     },
     /// Subscribe to a pub/sub topic and print events
     Sub { topic: String },
+    /// Request/reply RPC: publish a request and block for a single
+    /// correlated reply, printing its JSON body
+    Call {
+        queue: String,
+        /// JSON payload (reads stdin when omitted)
+        payload: Option<String>,
+        /// Seconds to wait for a reply before erroring
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
+    },
     /// Run a worker against a work queue
     Worker {
         queue: String,
@@ -236,6 +246,14 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Sub { topic } => {
             let ctx = Ctx::load(cli.config, cli.json)?;
             commands::subscribe_cmd(&ctx, &topic).await
+        }
+        Cmd::Call {
+            queue,
+            payload,
+            timeout,
+        } => {
+            let ctx = Ctx::load(cli.config, cli.json)?;
+            commands::call_cmd(&ctx, &queue, payload, timeout).await
         }
         Cmd::Worker {
             queue,

@@ -14,6 +14,7 @@ implements competing-consumer work queues. It is derived directly from
 | 4622  | message acked           | regular   |
 | 4623  | message nacked          | regular   |
 | 4624  | message dead-lettered   | regular   |
+| 4625  | RPC reply               | regular   |
 | 24620 | consumer heartbeat      | ephemeral |
 | 34620 | queue config snapshot   | addressable (reserved, unused in v0.1) |
 
@@ -35,6 +36,15 @@ with the publishing consumer's/producer's keypair.
 | `idem` | optional idempotency key |
 | `nbf` | optional not-before, unix seconds — message is not claimable before this time (delayed delivery) |
 | `exp` | optional expiry, unix seconds (SRS §11.3 reserved tag) — message must not be claimed once this time has passed (TTL) |
+| `reply` | optional — present only on RPC requests (see "Request/reply (RPC)" below); value is the requester's pubkey (hex) |
+
+**Reply events (kind 4625):**
+
+| Tag | Meaning |
+|-----|---------|
+| `e` | event id of the request's 4620 message event (via `Tag::event`) |
+| `p` | the requester's pubkey (via `Tag::public_key`) — addresses the reply back to whoever set `reply` on the request |
+| `parent` | the request's `mid`, for human-readable correlation alongside `e` |
 
 **Lifecycle events (kinds 4621-4624 — claim, ack, nack, dlq):**
 
@@ -221,6 +231,62 @@ terminal status, visible in `QueueStats.expired` / `nostr-q inspect`
 (human output: `expired: N`), and are not requeued by `dlq retry` — there is
 currently no CLI verb to resurrect an expired message; republish a fresh
 one instead.
+
+## Request/reply (RPC)
+
+An RPC call is an ordinary work-queue request that additionally asks for a
+single correlated reply. There is no separate claim/lease machinery for
+RPC — it reuses the exact same competing-consumer claim protocol described
+above, so exactly one responder processes a given request just like any
+other work-queue message.
+
+**Flow:**
+
+1. The caller (`NostrQ::call(queue, body, timeout)`) publishes a normal
+   kind 4620 message, additionally setting the `reply` tag to its own
+   pubkey (hex). This marks the message as an RPC request; `NqMessage`
+   exposes this as `reply_to: Option<String>`.
+2. The caller opens a subscription filtered to
+   `kind = 4625 AND #e = <request's event id>` immediately after
+   publishing, and also issues a direct `query` against the same filter
+   (covering a reply that a real relay delivered in the gap between
+   publish and subscribe). It then waits, bounded by `timeout`, for the
+   first matching kind 4625 event and returns its envelope `body`.
+3. Some responder claims the request through the normal claim protocol
+   (`try_claim`) — the same one-winner-per-message semantics as any other
+   work-queue message apply, so only the claim winner ever processes a
+   given request. `nostr-q-worker::run_worker` is the reference responder:
+   its `Handler::handle` returns `HandlerOutcome::Success { reply: Some(body)
+   }` to produce a reply (or `Success { reply: None }` for an ordinary,
+   non-reply-bearing success). `ExecHandler` treats non-empty JSON on
+   stdout as the reply body; `HttpHandler` treats a non-empty JSON 2xx
+   response body the same way.
+4. After a successful handler run that produced a reply body, the
+   responder publishes a kind 4625 event (`build_reply_event`) — `e`
+   referencing the request event, `p` addressing the requester pubkey from
+   the request's `reply` tag, `parent` carrying the request's `mid` — and
+   only then acks the request. If the reply publish itself fails, the
+   responder logs it and acks anyway: the request WAS processed correctly,
+   and a lost reply shouldn't cause the request to be redelivered.
+
+**Duplicate replies.** Because request delivery is at-least-once (see
+"Delivery guarantees" below) and because nothing prevents a second,
+independent reply from being published for the same request (e.g. a
+retried delivery, or a misbehaving responder), a caller may observe more
+than one kind 4625 event correlated to its request. `NostrQ::call` takes
+only the *first* matching reply and ignores any later ones — callers that
+need stronger de-duplication should include an idempotency marker in the
+request body itself and check it on the response side.
+
+**One responder, by claim.** Because request processing goes through the
+same claim protocol as any other work-queue message, only the claim winner
+runs the handler and (potentially) publishes a reply — other workers
+subscribed to the same queue back off exactly as they would for a non-RPC
+message. This means an RPC call has the same at-least-once processing
+characteristics as the underlying work queue: a claim winner whose reply
+event never reaches the relay (network partition, crash after ack) leaves
+the caller to time out, even though the request itself was processed
+exactly once from the responder's point of view.
 
 ## Local state is per-node
 

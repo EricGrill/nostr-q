@@ -11,6 +11,19 @@ use crate::{Handler, HandlerOutcome, JobContext};
 /// outside `run_worker`'s lease-timeout safety net.
 const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Parse a handler's raw output as an RPC reply body: `None` when it's
+/// empty (the common, non-RPC case), `Some(json)` when it parses as JSON,
+/// and `None` (rather than an error) when it's non-empty but not valid
+/// JSON — a handler that just logs to stdout/returns a non-JSON body
+/// shouldn't fail the job over it; it simply produces no reply.
+fn parse_reply_body(raw: &[u8]) -> Option<serde_json::Value> {
+    let trimmed = std::str::from_utf8(raw).ok()?.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    serde_json::from_str(trimmed).ok()
+}
+
 /// Runs `sh -c <command>` with the payload JSON on stdin and job metadata
 /// in NQ_* environment variables. Exit 0 => ack, anything else => nack.
 pub struct ExecHandler {
@@ -49,7 +62,9 @@ impl Handler for ExecHandler {
             }
         }
         match child.wait_with_output().await {
-            Ok(out) if out.status.success() && stdin_error.is_none() => HandlerOutcome::Success,
+            Ok(out) if out.status.success() && stdin_error.is_none() => HandlerOutcome::Success {
+                reply: parse_reply_body(&out.stdout),
+            },
             Ok(out) if out.status.success() => {
                 HandlerOutcome::Failure(format!("stdin write failed: {}", stdin_error.unwrap()))
             }
@@ -115,7 +130,13 @@ impl Handler for HttpHandler {
             "payload": job.payload,
         });
         match self.client.post(&self.url).json(&body).send().await {
-            Ok(resp) if resp.status().is_success() => HandlerOutcome::Success,
+            Ok(resp) if resp.status().is_success() => {
+                let reply = match resp.bytes().await {
+                    Ok(bytes) => parse_reply_body(&bytes),
+                    Err(_) => None,
+                };
+                HandlerOutcome::Success { reply }
+            }
             Ok(resp) => HandlerOutcome::Failure(format!("http status {}", resp.status())),
             Err(e) => HandlerOutcome::Failure(format!("http request failed: {e}")),
         }
