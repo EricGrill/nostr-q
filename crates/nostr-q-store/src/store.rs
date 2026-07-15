@@ -1,7 +1,9 @@
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
+use nostr_q_core::queue::{Delivery, Encryption, QueueConfig, QueueMode};
 use rusqlite::Connection;
 
 const SCHEMA_V1: &str = r#"
@@ -90,6 +92,78 @@ impl Store {
         Ok(conn.query_row("PRAGMA user_version", [], |r| r.get(0))?)
     }
 
+    pub fn upsert_queue(&self, q: &QueueConfig) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO queues (name, mode, delivery, encryption, max_attempts, lease_seconds, retry_base_seconds, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(name) DO UPDATE SET
+               mode=excluded.mode, delivery=excluded.delivery, encryption=excluded.encryption,
+               max_attempts=excluded.max_attempts, lease_seconds=excluded.lease_seconds,
+               retry_base_seconds=excluded.retry_base_seconds",
+            rusqlite::params![
+                q.name, q.mode.as_str(), q.delivery.as_str(), q.encryption.as_str(),
+                q.max_attempts, q.lease_seconds as i64, q.retry_base_seconds as i64, Self::now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn row_to_queue(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueueConfig> {
+        Ok(QueueConfig {
+            name: row.get(0)?,
+            mode: QueueMode::from_str(&row.get::<_, String>(1)?).unwrap_or(QueueMode::WorkQueue),
+            delivery: Delivery::from_str(&row.get::<_, String>(2)?).unwrap_or(Delivery::AtLeastOnce),
+            encryption: Encryption::from_str(&row.get::<_, String>(3)?).unwrap_or_default(),
+            max_attempts: row.get(4)?,
+            lease_seconds: row.get::<_, i64>(5)? as u64,
+            retry_base_seconds: row.get::<_, i64>(6)? as u64,
+        })
+    }
+
+    const QUEUE_COLS: &'static str =
+        "name, mode, delivery, encryption, max_attempts, lease_seconds, retry_base_seconds";
+
+    pub fn get_queue(&self, name: &str) -> Result<Option<QueueConfig>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM queues WHERE name = ?1", Self::QUEUE_COLS
+        ))?;
+        let mut rows = stmt.query_map([name], Self::row_to_queue)?;
+        Ok(rows.next().transpose()?)
+    }
+
+    pub fn list_queues(&self) -> Result<Vec<QueueConfig>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM queues ORDER BY name", Self::QUEUE_COLS
+        ))?;
+        let rows = stmt.query_map([], Self::row_to_queue)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn add_relay(&self, url: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO relays (url, added_at) VALUES (?1, ?2)",
+            rusqlite::params![url, Self::now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_relays(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT url FROM relays ORDER BY url")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn remove_relay(&self, url: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM relays WHERE url = ?1", [url])?;
+        Ok(())
+    }
+
     pub(crate) fn now() -> i64 {
         chrono::Utc::now().timestamp()
     }
@@ -116,5 +190,32 @@ mod tests {
     fn in_memory_store_works() {
         let store = Store::open_in_memory().unwrap();
         assert_eq!(store.schema_version().unwrap(), 1);
+    }
+
+    #[test]
+    fn queue_crud_roundtrip() {
+        use nostr_q_core::queue::QueueConfig;
+        let store = Store::open_in_memory().unwrap();
+        let q = QueueConfig::work_queue("jobs.email");
+        store.upsert_queue(&q).unwrap();
+        assert_eq!(store.get_queue("jobs.email").unwrap().unwrap(), q);
+        assert!(store.get_queue("nope").unwrap().is_none());
+        // upsert overwrites
+        let mut q2 = q.clone();
+        q2.max_attempts = 9;
+        store.upsert_queue(&q2).unwrap();
+        assert_eq!(store.get_queue("jobs.email").unwrap().unwrap().max_attempts, 9);
+        store.upsert_queue(&QueueConfig::pubsub("events.x")).unwrap();
+        assert_eq!(store.list_queues().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn relay_crud() {
+        let store = Store::open_in_memory().unwrap();
+        store.add_relay("wss://relay.example.com").unwrap();
+        store.add_relay("wss://relay.example.com").unwrap(); // idempotent
+        assert_eq!(store.list_relays().unwrap(), vec!["wss://relay.example.com".to_string()]);
+        store.remove_relay("wss://relay.example.com").unwrap();
+        assert!(store.list_relays().unwrap().is_empty());
     }
 }
