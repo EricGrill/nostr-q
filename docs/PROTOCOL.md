@@ -134,7 +134,7 @@ original claimant, may re-claim it).
 
 A dead-letter (kind 4624) event on the relay is not, by itself, permanent
 proof that a message should never be reclaimed: an operator can run
-`nq dlq retry`, which requeues the message locally and grants it a fresh
+`nostr-q dlq retry`, which requeues the message locally and grants it a fresh
 attempt budget (`attempt_floor = attempts` at retry time — see
 `Store::dlq_retry`), while the old dlq event remains on the relay forever
 (events are never deleted). If a worker's terminal check treated *any*
