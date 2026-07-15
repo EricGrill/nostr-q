@@ -10,6 +10,11 @@ pub struct Config {
 }
 
 pub fn expand_tilde(s: &str) -> PathBuf {
+    if s == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+    }
     if let Some(rest) = s.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
             return home.join(rest);
@@ -26,9 +31,9 @@ pub fn default_config_path() -> PathBuf {
     if local.exists() {
         return local;
     }
-    dirs::config_dir()
+    dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("nostr-q/config.toml")
+        .join(".config/nostr-q/config.toml")
 }
 
 impl Config {
@@ -56,7 +61,7 @@ impl Config {
 
     pub fn state_path(&self) -> PathBuf {
         if let Ok(p) = std::env::var("NQ_STATE") {
-            return PathBuf::from(p);
+            return expand_tilde(&p);
         }
         expand_tilde(&self.state)
     }
@@ -101,6 +106,18 @@ mod tests {
         assert!(!p.to_string_lossy().starts_with('~'));
         assert!(p.ends_with("x/y"));
         assert_eq!(expand_tilde("/abs/path"), std::path::PathBuf::from("/abs/path"));
+        assert_eq!(expand_tilde("~"), dirs::home_dir().unwrap());
+    }
+
+    #[test]
+    fn default_config_path_is_xdg_style() {
+        // Only meaningful when NQ_CONFIG is unset and ./nostr-q.toml absent —
+        // both true in the test environment.
+        let p = default_config_path();
+        assert!(
+            p.ends_with(".config/nostr-q/config.toml") || p == std::path::Path::new("nostr-q.toml"),
+            "{p:?}"
+        );
     }
 
     #[test]
