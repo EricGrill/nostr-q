@@ -314,7 +314,10 @@ mod tests {
     #[tokio::test]
     async fn slow_handler_times_out_and_nacks() {
         let nq = make_nq();
-        let receipt = nq.publish("jobs.email", json!({"n": 1}), None).await.unwrap();
+        let receipt = nq
+            .publish("jobs.email", json!({"n": 1}), None)
+            .await
+            .unwrap();
         let shutdown = CancellationToken::new();
         let opts = WorkerOptions {
             concurrency: 1,
@@ -326,7 +329,9 @@ mod tests {
         let handle = tokio::spawn(run_worker(
             nq.clone(),
             "jobs.email".into(),
-            Arc::new(crate::handlers::ExecHandler { command: "sleep 30".into() }),
+            Arc::new(crate::handlers::ExecHandler {
+                command: "sleep 30".into(),
+            }),
             opts,
             shutdown.clone(),
         ));
@@ -352,7 +357,9 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/jobs/ok"))
-            .and(body_partial_json(serde_json::json!({"mid": "m1", "payload": {"n": 1}})))
+            .and(body_partial_json(
+                serde_json::json!({"mid": "m1", "payload": {"n": 1}}),
+            ))
             .respond_with(ResponseTemplate::new(200))
             .mount(&server)
             .await;

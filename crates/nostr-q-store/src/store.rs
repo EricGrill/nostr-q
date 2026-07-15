@@ -144,7 +144,9 @@ impl Store {
             conn.execute_batch(SCHEMA_V1)?;
             conn.pragma_update(None, "user_version", 1)?;
         }
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     pub fn schema_version(&self) -> Result<i64> {
@@ -173,7 +175,8 @@ impl Store {
         Ok(QueueConfig {
             name: row.get(0)?,
             mode: QueueMode::from_str(&row.get::<_, String>(1)?).unwrap_or(QueueMode::WorkQueue),
-            delivery: Delivery::from_str(&row.get::<_, String>(2)?).unwrap_or(Delivery::AtLeastOnce),
+            delivery: Delivery::from_str(&row.get::<_, String>(2)?)
+                .unwrap_or(Delivery::AtLeastOnce),
             encryption: Encryption::from_str(&row.get::<_, String>(3)?).unwrap_or_default(),
             max_attempts: row.get(4)?,
             lease_seconds: row.get::<_, i64>(5)? as u64,
@@ -187,7 +190,8 @@ impl Store {
     pub fn get_queue(&self, name: &str) -> Result<Option<QueueConfig>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&format!(
-            "SELECT {} FROM queues WHERE name = ?1", Self::QUEUE_COLS
+            "SELECT {} FROM queues WHERE name = ?1",
+            Self::QUEUE_COLS
         ))?;
         let mut rows = stmt.query_map([name], Self::row_to_queue)?;
         Ok(rows.next().transpose()?)
@@ -196,7 +200,8 @@ impl Store {
     pub fn list_queues(&self) -> Result<Vec<QueueConfig>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&format!(
-            "SELECT {} FROM queues ORDER BY name", Self::QUEUE_COLS
+            "SELECT {} FROM queues ORDER BY name",
+            Self::QUEUE_COLS
         ))?;
         let rows = stmt.query_map([], Self::row_to_queue)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -240,8 +245,7 @@ impl Store {
 
     pub fn get_message(&self, mid: &str) -> Result<Option<MessageRecord>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare(&format!("SELECT {MSG_COLS} FROM messages WHERE mid = ?1"))?;
+        let mut stmt = conn.prepare(&format!("SELECT {MSG_COLS} FROM messages WHERE mid = ?1"))?;
         let mut rows = stmt.query_map([mid], row_to_message)?;
         Ok(rows.next().transpose()?)
     }
@@ -302,7 +306,11 @@ impl Store {
             "UPDATE messages SET attempts = attempts + 1, updated_at=?2 WHERE mid=?1",
             rusqlite::params![mid, Self::now()],
         )?;
-        Ok(conn.query_row("SELECT attempts FROM messages WHERE mid=?1", [mid], |r| r.get(0))?)
+        Ok(
+            conn.query_row("SELECT attempts FROM messages WHERE mid=?1", [mid], |r| {
+                r.get(0)
+            })?,
+        )
     }
 
     pub fn move_to_dlq(&self, mid: &str, reason: &str) -> Result<()> {
@@ -323,12 +331,16 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let map = |row: &rusqlite::Row<'_>| -> rusqlite::Result<DlqRecord> {
             Ok(DlqRecord {
-                mid: row.get(0)?, queue: row.get(1)?, reason: row.get(2)?,
-                attempts: row.get(3)?, dead_at: row.get(4)?,
+                mid: row.get(0)?,
+                queue: row.get(1)?,
+                reason: row.get(2)?,
+                attempts: row.get(3)?,
+                dead_at: row.get(4)?,
             })
         };
         let sql_all = "SELECT mid, queue, reason, attempts, dead_at FROM dlq ORDER BY dead_at";
-        let sql_q = "SELECT mid, queue, reason, attempts, dead_at FROM dlq WHERE queue=?1 ORDER BY dead_at";
+        let sql_q =
+            "SELECT mid, queue, reason, attempts, dead_at FROM dlq WHERE queue=?1 ORDER BY dead_at";
         let out = match queue {
             Some(q) => {
                 let mut stmt = conn.prepare(sql_q)?;
@@ -354,7 +366,13 @@ impl Store {
         Ok(())
     }
 
-    pub fn record_lifecycle(&self, mid: &str, trace_id: &str, kind: &str, detail: &str) -> Result<()> {
+    pub fn record_lifecycle(
+        &self,
+        mid: &str,
+        trace_id: &str,
+        kind: &str,
+        detail: &str,
+    ) -> Result<()> {
         self.update(
             "INSERT INTO lifecycle (mid, trace_id, kind, detail, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             rusqlite::params![mid, trace_id, kind, detail, Self::now()],
@@ -368,8 +386,11 @@ impl Store {
         )?;
         let rows = stmt.query_map([trace_id], |row| {
             Ok(LifecycleRecord {
-                mid: row.get(0)?, trace_id: row.get(1)?, kind: row.get(2)?,
-                detail: row.get(3)?, created_at: row.get(4)?,
+                mid: row.get(0)?,
+                trace_id: row.get(1)?,
+                kind: row.get(2)?,
+                detail: row.get(3)?,
+                created_at: row.get(4)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -391,13 +412,11 @@ impl Store {
                 |r| r.get(0),
             )
         };
-        let oldest: Option<i64> = conn
-            .query_row(
-                "SELECT MIN(created_at) FROM messages WHERE queue=?1 AND status='pending'",
-                [queue],
-                |r| r.get(0),
-            )
-            ?;
+        let oldest: Option<i64> = conn.query_row(
+            "SELECT MIN(created_at) FROM messages WHERE queue=?1 AND status='pending'",
+            [queue],
+            |r| r.get(0),
+        )?;
         Ok(QueueStats {
             pending: count("pending")?,
             in_flight: count("claimed")?,
@@ -447,8 +466,13 @@ mod tests {
         let mut q2 = q.clone();
         q2.max_attempts = 9;
         store.upsert_queue(&q2).unwrap();
-        assert_eq!(store.get_queue("jobs.email").unwrap().unwrap().max_attempts, 9);
-        store.upsert_queue(&QueueConfig::pubsub("events.x")).unwrap();
+        assert_eq!(
+            store.get_queue("jobs.email").unwrap().unwrap().max_attempts,
+            9
+        );
+        store
+            .upsert_queue(&QueueConfig::pubsub("events.x"))
+            .unwrap();
         assert_eq!(store.list_queues().unwrap().len(), 2);
     }
 
@@ -457,7 +481,10 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         store.add_relay("wss://relay.example.com").unwrap();
         store.add_relay("wss://relay.example.com").unwrap(); // idempotent
-        assert_eq!(store.list_relays().unwrap(), vec!["wss://relay.example.com".to_string()]);
+        assert_eq!(
+            store.list_relays().unwrap(),
+            vec!["wss://relay.example.com".to_string()]
+        );
         store.remove_relay("wss://relay.example.com").unwrap();
         assert!(store.list_relays().unwrap().is_empty());
     }
@@ -547,12 +574,19 @@ mod tests {
     fn trace_and_stats() {
         let store = Store::open_in_memory().unwrap();
         store.insert_message(&rec("m1", "q")).unwrap();
-        store.record_lifecycle("m1", "tr-m1", "published", "q").unwrap();
-        store.record_lifecycle("m1", "tr-m1", "claimed", "pubkey-a").unwrap();
+        store
+            .record_lifecycle("m1", "tr-m1", "published", "q")
+            .unwrap();
+        store
+            .record_lifecycle("m1", "tr-m1", "claimed", "pubkey-a")
+            .unwrap();
         let t = store.trace("tr-m1").unwrap();
         assert_eq!(t.len(), 2);
         assert_eq!(t[0].kind, "published");
-        assert_eq!(store.trace_id_for_mid("m1").unwrap().as_deref(), Some("tr-m1"));
+        assert_eq!(
+            store.trace_id_for_mid("m1").unwrap().as_deref(),
+            Some("tr-m1")
+        );
 
         let stats = store.stats("q", 200).unwrap();
         assert_eq!(stats.pending, 1);

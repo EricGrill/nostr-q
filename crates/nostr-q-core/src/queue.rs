@@ -67,9 +67,15 @@ pub struct QueueConfig {
     pub retry_base_seconds: u64,
 }
 
-fn default_max_attempts() -> u32 { 5 }
-fn default_lease_seconds() -> u64 { 60 }
-fn default_retry_base_seconds() -> u64 { 5 }
+fn default_max_attempts() -> u32 {
+    5
+}
+fn default_lease_seconds() -> u64 {
+    60
+}
+fn default_retry_base_seconds() -> u64 {
+    5
+}
 
 impl QueueConfig {
     pub fn work_queue(name: &str) -> Self {
@@ -122,8 +128,14 @@ mod tests {
 
     #[test]
     fn parse_from_cli_strings() {
-        assert_eq!(QueueMode::from_str("work_queue").unwrap(), QueueMode::WorkQueue);
-        assert_eq!(Delivery::from_str("at_least_once").unwrap(), Delivery::AtLeastOnce);
+        assert_eq!(
+            QueueMode::from_str("work_queue").unwrap(),
+            QueueMode::WorkQueue
+        );
+        assert_eq!(
+            Delivery::from_str("at_least_once").unwrap(),
+            Delivery::AtLeastOnce
+        );
         assert!(QueueMode::from_str("bogus").is_err());
         assert_eq!(QueueMode::WorkQueue.as_str(), "work_queue");
     }
@@ -138,10 +150,9 @@ mod tests {
         let back: QueueConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back, q);
         // encryption/max_attempts/lease/retry_base may be omitted and default
-        let sparse: QueueConfig = serde_json::from_str(
-            r#"{"name":"x","mode":"pubsub","delivery":"best_effort"}"#,
-        )
-        .unwrap();
+        let sparse: QueueConfig =
+            serde_json::from_str(r#"{"name":"x","mode":"pubsub","delivery":"best_effort"}"#)
+                .unwrap();
         assert_eq!(sparse.encryption, Encryption::None);
         assert_eq!(sparse.max_attempts, 5);
         assert_eq!(sparse.lease_seconds, 60);

@@ -334,7 +334,10 @@ pub fn dlq_list_cmd(ctx: &Ctx, queue: Option<String>) -> Result<()> {
         println!("dead-letter queue is empty");
     } else {
         for r in rows {
-            println!("{:<28} {:<24} attempts={} reason={}", r.mid, r.queue, r.attempts, r.reason);
+            println!(
+                "{:<28} {:<24} attempts={} reason={}",
+                r.mid, r.queue, r.attempts, r.reason
+            );
         }
     }
     Ok(())
@@ -345,9 +348,14 @@ pub fn dlq_retry_cmd(ctx: &Ctx, mid: &str) -> Result<()> {
         .store
         .get_message(mid)?
         .ok_or_else(|| anyhow::anyhow!("unknown message id '{mid}'"))?;
-    anyhow::ensure!(rec.status == "dead", "message '{mid}' is not dead-lettered (status: {})", rec.status);
+    anyhow::ensure!(
+        rec.status == "dead",
+        "message '{mid}' is not dead-lettered (status: {})",
+        rec.status
+    );
     ctx.store.dlq_retry(mid)?;
-    ctx.store.record_lifecycle(mid, &rec.trace_id, "dlq_retried", "manual retry via cli")?;
+    ctx.store
+        .record_lifecycle(mid, &rec.trace_id, "dlq_retried", "manual retry via cli")?;
     println!("requeued {mid} on '{}'", rec.queue);
     Ok(())
 }

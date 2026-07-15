@@ -17,7 +17,10 @@ pub struct MockTransport {
 impl MockTransport {
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(1024);
-        Self { events: Mutex::new(Vec::new()), tx }
+        Self {
+            events: Mutex::new(Vec::new()),
+            tx,
+        }
     }
 }
 
@@ -87,7 +90,11 @@ impl Transport for MockTransport {
     }
 
     async fn health(&self) -> Vec<RelayHealth> {
-        vec![RelayHealth { url: "mock://".into(), connected: true, latency_ms: Some(0) }]
+        vec![RelayHealth {
+            url: "mock://".into(),
+            connected: true,
+            latency_ms: Some(0),
+        }]
     }
 }
 
@@ -152,7 +159,10 @@ mod tests {
         let got = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 let e = rx.recv().await.expect("subscription must stay alive");
-                if e.tags.iter().any(|t| t.as_slice().get(1).map(String::as_str) == Some("a")) {
+                if e.tags
+                    .iter()
+                    .any(|t| t.as_slice().get(1).map(String::as_str) == Some("a"))
+                {
                     return e;
                 }
             }

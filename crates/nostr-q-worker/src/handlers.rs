@@ -61,7 +61,10 @@ pub struct HttpHandler {
 
 impl HttpHandler {
     pub fn new(url: String) -> Self {
-        Self { url, client: reqwest::Client::new() }
+        Self {
+            url,
+            client: reqwest::Client::new(),
+        }
     }
 }
 

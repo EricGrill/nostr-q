@@ -5,7 +5,11 @@ use clap::{Parser, Subcommand};
 use commands::Ctx;
 
 #[derive(Parser)]
-#[command(name = "nq", version, about = "Nostr-Q: message queues and pub/sub over Nostr relays")]
+#[command(
+    name = "nq",
+    version,
+    about = "Nostr-Q: message queues and pub/sub over Nostr relays"
+)]
 struct Cli {
     /// Config file path (default: $NQ_CONFIG, ./nostr-q.toml, ~/.config/nostr-q/config.toml)
     #[arg(long, global = true)]
@@ -159,13 +163,21 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Queue { cmd } => {
             let ctx = Ctx::load(cli.config, cli.json)?;
             match cmd {
-                QueueCmd::Create { name, mode, delivery, max_attempts, lease } => {
-                    commands::queue_create(&ctx, &name, &mode, delivery, max_attempts, lease)
-                }
+                QueueCmd::Create {
+                    name,
+                    mode,
+                    delivery,
+                    max_attempts,
+                    lease,
+                } => commands::queue_create(&ctx, &name, &mode, delivery, max_attempts, lease),
                 QueueCmd::List => commands::queue_list(&ctx),
             }
         }
-        Cmd::Pub { queue, payload, idem } => {
+        Cmd::Pub {
+            queue,
+            payload,
+            idem,
+        } => {
             let ctx = Ctx::load(cli.config, cli.json)?;
             commands::publish(&ctx, &queue, payload, idem).await
         }
@@ -173,9 +185,27 @@ async fn main() -> anyhow::Result<()> {
             let ctx = Ctx::load(cli.config, cli.json)?;
             commands::subscribe_cmd(&ctx, &topic).await
         }
-        Cmd::Worker { queue, exec, http, concurrency, lease, max_attempts, heartbeat } => {
+        Cmd::Worker {
+            queue,
+            exec,
+            http,
+            concurrency,
+            lease,
+            max_attempts,
+            heartbeat,
+        } => {
             let ctx = Ctx::load(cli.config, cli.json)?;
-            commands::worker(&ctx, &queue, exec, http, concurrency, lease, max_attempts, heartbeat).await
+            commands::worker(
+                &ctx,
+                &queue,
+                exec,
+                http,
+                concurrency,
+                lease,
+                max_attempts,
+                heartbeat,
+            )
+            .await
         }
         Cmd::Inspect { queue } => {
             let ctx = Ctx::load(cli.config, cli.json)?;
