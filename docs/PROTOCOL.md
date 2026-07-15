@@ -43,7 +43,7 @@ with the publishing consumer's/producer's keypair.
 | `mid` | message id |
 | `trace` | trace id |
 | `lease_exp` | (claim only) lease expiry, unix seconds |
-| `attempt` | (nack only) delivery attempt number |
+| `attempt` | (claim) the delivery attempt this claim is for; (nack) delivery attempt number |
 | `reason` | (nack, dlq) failure reason string |
 
 Heartbeat events (24620) carry only a `t` tag for the queue being worked.
@@ -86,7 +86,9 @@ process the same message:
    `lease_exp` has not yet passed, the one with the lowest
    `(created_at, claim_event_id_hex)` tuple wins. This tiebreak is
    reproducible by any observer with the same claim set, so no
-   coordination beyond the relay's event set is required.
+   coordination beyond the relay's event set is required. Claims declare
+   the attempt they are for; a nack at attempt N releases all claims for
+   earlier attempts, so retries are not blocked by their own stale claims.
 4. Only the winner runs the message handler. If the winner's handler does
    not ack or nack before `lease_exp`, the lease is considered expired and
    the message becomes claimable again (any consumer, including the

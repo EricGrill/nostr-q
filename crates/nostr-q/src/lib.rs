@@ -11,8 +11,8 @@ use nostr_q_core::envelope::Envelope;
 use nostr_q_core::ids::{new_mid, new_trace_id};
 use nostr_q_core::protocol::{
     build_ack_event, build_claim_event, build_dlq_event, build_message_event, build_nack_event,
-    claim_winner, parse_claim_event, parse_message_event, ClaimInfo, NqMessage, KIND_CLAIM,
-    KIND_MESSAGE,
+    claim_winner, event_attempt, parse_claim_event, parse_message_event, ClaimInfo, NqMessage,
+    KIND_CLAIM, KIND_MESSAGE, KIND_NACK,
 };
 use nostr_q_core::queue::QueueMode;
 use nostr_q_relay::Transport;
@@ -149,6 +149,7 @@ impl NostrQ {
             &rec.mid,
             &rec.trace_id,
             lease_expires_at,
+            rec.attempts,
         )?;
         let our_claim_id = claim.id;
         self.transport.publish(claim).await?;
@@ -164,7 +165,18 @@ impl NostrQ {
             .iter()
             .filter_map(|e| parse_claim_event(e).ok())
             .collect();
-        let we_won = claim_winner(&claims, now)
+        let nack_filter = Filter::new()
+            .kind(Kind::Custom(KIND_NACK))
+            .event(message_event_id);
+        let min_attempt = self
+            .transport
+            .query(nack_filter)
+            .await?
+            .iter()
+            .map(event_attempt)
+            .max()
+            .unwrap_or(0);
+        let we_won = claim_winner(&claims, min_attempt, now)
             .map(|w| w.claim_event_id == our_claim_id)
             .unwrap_or(false);
         if we_won {
@@ -573,6 +585,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(dlq_events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn retry_claim_wins_immediately_after_nack() {
+        let (nq, _) = setup();
+        let receipt = nq
+            .publish("jobs.email", json!({"n": 1}), None)
+            .await
+            .unwrap();
+        let rec = nq.store().get_message(&receipt.mid).unwrap().unwrap();
+        assert!(nq.try_claim(&rec, 60, 10).await.unwrap());
+        // handler fails -> nack schedules a retry
+        match nq.nack(&receipt.mid, "boom").await.unwrap() {
+            NackOutcome::Retry { .. } => {}
+            other => panic!("expected retry, got {other:?}"),
+        }
+        // the retry must win the claim race NOW, not after the 60s lease expires
+        let rec = nq.store().get_message(&receipt.mid).unwrap().unwrap();
+        assert_eq!(rec.attempts, 1);
+        assert!(
+            nq.try_claim(&rec, 60, 10).await.unwrap(),
+            "retry claim must not lose to its own stale pre-nack claim"
+        );
     }
 
     #[test]
