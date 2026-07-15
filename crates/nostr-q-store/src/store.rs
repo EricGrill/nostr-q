@@ -370,6 +370,42 @@ impl Store {
         Ok(())
     }
 
+    /// Mark a message dead because this worker *observed* a remote DLQ
+    /// event (rather than dead-lettering it itself), healing the local
+    /// `attempts` counter up to that event's `attempt` generation in the
+    /// process.
+    ///
+    /// Without this healing, a worker that never nacked a message locally
+    /// (so `attempts` stayed at 0) but later saw a remote dlq event with
+    /// `attempt > 0` would mark the row dead with `attempts` still at 0. A
+    /// subsequent `dlq_retry` sets `attempt_floor = attempts = 0`, which
+    /// leaves the historical remote dlq event's `attempt` (> 0) still
+    /// greater than the new floor — so `try_claim`'s terminal check
+    /// immediately re-kills the row on the very next survey, silently
+    /// undoing the retry. Healing `attempts` to `MAX(attempts, attempt)`
+    /// here (the same pattern `mark_claimed` uses) means `dlq_retry` sets
+    /// `attempt_floor` to that healed value, so the historical dlq event's
+    /// `attempt` is `<= attempt_floor` afterward — not terminal — and the
+    /// retry grants a real fresh budget instead of being immediately
+    /// undone.
+    pub fn move_to_dlq_at(&self, mid: &str, reason: &str, attempt: u32) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE messages SET status='dead', attempts = MAX(attempts, ?3), \
+             lease_expires_at=NULL, updated_at=?2 WHERE mid=?1",
+            rusqlite::params![mid, Self::now(), attempt],
+        )?;
+        if n == 0 {
+            anyhow::bail!("no message with mid {mid}");
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO dlq (mid, queue, reason, attempts, dead_at)
+             SELECT mid, queue, ?2, attempts, ?3 FROM messages WHERE mid=?1",
+            rusqlite::params![mid, reason, Self::now()],
+        )?;
+        Ok(())
+    }
+
     pub fn dlq_list(&self, queue: Option<&str>) -> Result<Vec<DlqRecord>> {
         let conn = self.conn.lock().unwrap();
         let map = |row: &rusqlite::Row<'_>| -> rusqlite::Result<DlqRecord> {
