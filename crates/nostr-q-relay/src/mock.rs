@@ -58,9 +58,17 @@ impl Transport for MockTransport {
                     return;
                 }
             }
-            while let Ok(e) = live.recv().await {
-                if filter.match_event(&e) && out_tx.send(e).await.is_err() {
-                    return;
+            loop {
+                match live.recv().await {
+                    Ok(e) => {
+                        if filter.match_event(&e) && out_tx.send(e).await.is_err() {
+                            return;
+                        }
+                    }
+                    // Lagged skips missed events but the channel is still live —
+                    // keep forwarding rather than silently dropping the subscriber.
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return,
                 }
             }
         });
@@ -125,5 +133,32 @@ mod tests {
         t.publish(event(&keys, 4620, "other")).await.unwrap(); // filtered out
         let live = rx.recv().await.unwrap();
         assert_eq!(live.kind.as_u16(), 4620);
+    }
+
+    #[tokio::test]
+    async fn subscriber_survives_broadcast_lag() {
+        let t = MockTransport::new();
+        let keys = Keys::generate();
+        let mut rx = t
+            .subscribe(Filter::new().kind(Kind::Custom(4620)).hashtag("a"))
+            .await
+            .unwrap();
+        // Overflow the 1024-capacity broadcast channel while the forwarding
+        // task may be behind, then confirm the subscription still delivers.
+        for _ in 0..1100 {
+            t.publish(event(&keys, 4620, "other")).await.unwrap();
+        }
+        t.publish(event(&keys, 4620, "a")).await.unwrap();
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let e = rx.recv().await.expect("subscription must stay alive");
+                if e.tags.iter().any(|t| t.as_slice().get(1).map(String::as_str) == Some("a")) {
+                    return e;
+                }
+            }
+        })
+        .await
+        .expect("subscriber should still receive after lag");
+        assert_eq!(got.kind.as_u16(), 4620);
     }
 }
