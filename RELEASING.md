@@ -26,9 +26,8 @@ Releases are built with `cargo-dist` and published from GitHub Actions.
    ```
 
 Run `dist init` again whenever cargo-dist config changes. It updates
-`.github/workflows/release.yml` while preserving supported settings. After any
-regeneration, confirm the Homebrew tap commit identity remains
-`github-actions[bot]`, not the cargo-dist template default.
+`.github/workflows/release.yml`; keep the generated file in sync so
+`dist plan` passes in CI.
 
 ## Release Checklist
 
