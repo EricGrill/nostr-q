@@ -23,7 +23,8 @@ impl Handler for ExecHandler {
             .env("NQ_ATTEMPT", job.attempt.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
         if let Some(idem) = &job.idem {
             cmd.env("NQ_IDEM", idem);
         }
@@ -41,7 +42,10 @@ impl Handler for ExecHandler {
             Ok(out) if out.status.success() => HandlerOutcome::Success,
             Ok(out) => HandlerOutcome::Failure(format!(
                 "exit {}: {}",
-                out.status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into()),
+                out.status
+                    .code()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "signal".into()),
                 String::from_utf8_lossy(&out.stderr).trim()
             )),
             Err(e) => HandlerOutcome::Failure(format!("wait failed: {e}")),

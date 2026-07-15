@@ -114,7 +114,19 @@ pub async fn run_worker(
                     Ok(true) => {
                         let job = JobContext::from_record(&rec);
                         tracing::info!(mid = %job.mid, attempt = job.attempt, "running handler");
-                        let outcome = handler.handle(&job).await;
+                        let outcome = match tokio::time::timeout(
+                            Duration::from_secs(lease),
+                            handler.handle(&job),
+                        )
+                        .await
+                        {
+                            Ok(outcome) => outcome,
+                            // The lease has expired anyway — another worker may reclaim the
+                            // message. Nack so the attempt is recorded and retried.
+                            Err(_) => HandlerOutcome::Failure(format!(
+                                "handler timed out after {lease}s (lease expired)"
+                            )),
+                        };
                         let settled = match outcome {
                             HandlerOutcome::Success => nq.ack(&rec.mid).await,
                             HandlerOutcome::Failure(reason) => {
@@ -158,8 +170,14 @@ mod tests {
 
     fn make_nq() -> Arc<NostrQ> {
         let store = Arc::new(Store::open_in_memory().unwrap());
-        store.upsert_queue(&QueueConfig::work_queue("jobs.email")).unwrap();
-        Arc::new(NostrQ::new(Keys::generate(), store, Arc::new(MockTransport::new())))
+        store
+            .upsert_queue(&QueueConfig::work_queue("jobs.email"))
+            .unwrap();
+        Arc::new(NostrQ::new(
+            Keys::generate(),
+            store,
+            Arc::new(MockTransport::new()),
+        ))
     }
 
     fn job() -> JobContext {
@@ -184,11 +202,19 @@ mod tests {
 
     #[tokio::test]
     async fn exec_handler_failure_captures_exit_and_stderr() {
-        let h = crate::handlers::ExecHandler { command: "echo oops >&2; exit 3".into() };
+        let h = crate::handlers::ExecHandler {
+            command: "echo oops >&2; exit 3".into(),
+        };
         match h.handle(&job()).await {
             HandlerOutcome::Failure(reason) => {
-                assert!(reason.contains('3'), "reason should mention exit code: {reason}");
-                assert!(reason.contains("oops"), "reason should include stderr: {reason}");
+                assert!(
+                    reason.contains('3'),
+                    "reason should mention exit code: {reason}"
+                );
+                assert!(
+                    reason.contains("oops"),
+                    "reason should include stderr: {reason}"
+                );
             }
             HandlerOutcome::Success => panic!("expected failure"),
         }
@@ -197,7 +223,10 @@ mod tests {
     #[tokio::test]
     async fn worker_loop_claims_runs_and_acks() {
         let nq = make_nq();
-        let receipt = nq.publish("jobs.email", json!({"n": 1}), None).await.unwrap();
+        let receipt = nq
+            .publish("jobs.email", json!({"n": 1}), None)
+            .await
+            .unwrap();
 
         let shutdown = CancellationToken::new();
         let opts = WorkerOptions {
@@ -210,14 +239,23 @@ mod tests {
         let handle = tokio::spawn(run_worker(
             nq.clone(),
             "jobs.email".into(),
-            Arc::new(crate::handlers::ExecHandler { command: "cat > /dev/null".into() }),
+            Arc::new(crate::handlers::ExecHandler {
+                command: "cat > /dev/null".into(),
+            }),
             opts,
             shutdown.clone(),
         ));
 
         let mut acked = false;
         for _ in 0..100 {
-            if nq.store().get_message(&receipt.mid).unwrap().unwrap().status == "acked" {
+            if nq
+                .store()
+                .get_message(&receipt.mid)
+                .unwrap()
+                .unwrap()
+                .status
+                == "acked"
+            {
                 acked = true;
                 break;
             }
@@ -231,22 +269,38 @@ mod tests {
     #[tokio::test]
     async fn worker_loop_nacks_failures() {
         let nq = make_nq();
-        let receipt = nq.publish("jobs.email", json!({"n": 1}), None).await.unwrap();
+        let receipt = nq
+            .publish("jobs.email", json!({"n": 1}), None)
+            .await
+            .unwrap();
         let shutdown = CancellationToken::new();
         let opts = WorkerOptions {
-            concurrency: 1, lease_seconds: 60, heartbeat_seconds: 3600, settle_ms: 10, poll_ms: 50,
+            concurrency: 1,
+            lease_seconds: 60,
+            heartbeat_seconds: 3600,
+            settle_ms: 10,
+            poll_ms: 50,
         };
         let handle = tokio::spawn(run_worker(
             nq.clone(),
             "jobs.email".into(),
-            Arc::new(crate::handlers::ExecHandler { command: "exit 1".into() }),
+            Arc::new(crate::handlers::ExecHandler {
+                command: "exit 1".into(),
+            }),
             opts,
             shutdown.clone(),
         ));
         // attempts should start climbing (retry backoff defers re-runs)
         let mut nacked = false;
         for _ in 0..100 {
-            if nq.store().get_message(&receipt.mid).unwrap().unwrap().attempts >= 1 {
+            if nq
+                .store()
+                .get_message(&receipt.mid)
+                .unwrap()
+                .unwrap()
+                .attempts
+                >= 1
+            {
                 nacked = true;
                 break;
             }
@@ -255,5 +309,38 @@ mod tests {
         shutdown.cancel();
         handle.await.unwrap().unwrap();
         assert!(nacked);
+    }
+
+    #[tokio::test]
+    async fn slow_handler_times_out_and_nacks() {
+        let nq = make_nq();
+        let receipt = nq.publish("jobs.email", json!({"n": 1}), None).await.unwrap();
+        let shutdown = CancellationToken::new();
+        let opts = WorkerOptions {
+            concurrency: 1,
+            lease_seconds: 1, // handler bounded to 1s
+            heartbeat_seconds: 3600,
+            settle_ms: 10,
+            poll_ms: 50,
+        };
+        let handle = tokio::spawn(run_worker(
+            nq.clone(),
+            "jobs.email".into(),
+            Arc::new(crate::handlers::ExecHandler { command: "sleep 30".into() }),
+            opts,
+            shutdown.clone(),
+        ));
+        let mut nacked = false;
+        for _ in 0..100 {
+            let rec = nq.store().get_message(&receipt.mid).unwrap().unwrap();
+            if rec.attempts >= 1 {
+                nacked = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        shutdown.cancel();
+        handle.await.unwrap().unwrap();
+        assert!(nacked, "timed-out handler must be nacked");
     }
 }
