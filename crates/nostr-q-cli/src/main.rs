@@ -26,6 +26,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: KeyCmd,
     },
+    /// Relay management
+    Relay {
+        #[command(subcommand)]
+        cmd: RelayCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -34,6 +39,18 @@ enum KeyCmd {
     Generate,
     /// Show the public key
     Show,
+}
+
+#[derive(Subcommand)]
+enum RelayCmd {
+    /// Add a relay URL
+    Add { url: String },
+    /// List configured relays
+    List,
+    /// Remove a relay URL
+    Remove { url: String },
+    /// Check connectivity and latency of configured relays
+    Health,
 }
 
 #[tokio::main]
@@ -50,6 +67,15 @@ async fn main() -> anyhow::Result<()> {
             match cmd {
                 KeyCmd::Generate => commands::key_generate(&ctx),
                 KeyCmd::Show => commands::key_show(&ctx),
+            }
+        }
+        Cmd::Relay { cmd } => {
+            let ctx = Ctx::load(cli.config, cli.json)?;
+            match cmd {
+                RelayCmd::Add { url } => commands::relay_add(&ctx, &url),
+                RelayCmd::List => commands::relay_list(&ctx),
+                RelayCmd::Remove { url } => commands::relay_remove(&ctx, &url),
+                RelayCmd::Health => commands::relay_health(&ctx).await,
             }
         }
     }

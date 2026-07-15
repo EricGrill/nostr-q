@@ -2,16 +2,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
-use nostr_q::relay::NostrTransport;
+use nostr_q::relay::{NostrTransport, Transport};
 use nostr_q::store_crate::Store;
 use nostr_q::NostrQ;
 
 use crate::config::{self, Config};
 
 // `store` and `json` are part of the Ctx public contract consumed by later
-// CLI tasks (queue/relay/publish/subscribe commands); the `key` subcommands
-// implemented here don't touch them yet.
-#[allow(dead_code)]
+// CLI tasks (queue/relay/publish/subscribe commands).
 pub struct Ctx {
     pub config: Config,
     pub store: Arc<Store>,
@@ -76,5 +74,55 @@ pub fn key_generate(ctx: &Ctx) -> Result<()> {
 pub fn key_show(ctx: &Ctx) -> Result<()> {
     let keys = config::load_keys(&ctx.config)?;
     println!("public key: {}", keys.public_key());
+    Ok(())
+}
+
+pub fn relay_add(ctx: &Ctx, url: &str) -> Result<()> {
+    anyhow::ensure!(
+        url.starts_with("wss://") || url.starts_with("ws://"),
+        "relay url must start with ws:// or wss://"
+    );
+    ctx.store.add_relay(url)?;
+    println!("added relay {url}");
+    Ok(())
+}
+
+pub fn relay_list(ctx: &Ctx) -> Result<()> {
+    let relays = ctx.store.list_relays()?;
+    if ctx.json {
+        println!("{}", serde_json::to_string(&relays)?);
+    } else if relays.is_empty() {
+        println!("no relays configured — add one with `nq relay add <url>`");
+    } else {
+        for url in relays {
+            println!("{url}");
+        }
+    }
+    Ok(())
+}
+
+pub fn relay_remove(ctx: &Ctx, url: &str) -> Result<()> {
+    ctx.store.remove_relay(url)?;
+    println!("removed relay {url}");
+    Ok(())
+}
+
+pub async fn relay_health(ctx: &Ctx) -> Result<()> {
+    let keys = config::load_keys(&ctx.config)?;
+    let relays = ctx.store.list_relays()?;
+    let transport = NostrTransport::connect(keys, &relays).await?;
+    let health = transport.health().await;
+    if ctx.json {
+        println!("{}", serde_json::to_string(&health)?);
+    } else {
+        for h in health {
+            let latency = h
+                .latency_ms
+                .map(|ms| format!("{ms}ms"))
+                .unwrap_or_else(|| "-".into());
+            let status = if h.connected { "connected" } else { "DOWN" };
+            println!("{:<40} {:<10} {}", h.url, status, latency);
+        }
+    }
     Ok(())
 }
