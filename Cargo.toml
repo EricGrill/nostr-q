@@ -28,7 +28,7 @@ tokio-util = "0.7"
 async-trait = "0.1"
 ulid = "1"
 chrono = { version = "0.4", features = ["serde"] }
-nostr = "0.39"
+nostr = "0.44"
 nostr-sdk = "0.39"
 rusqlite = { version = "0.31", features = ["bundled"] }
 clap = { version = "4", features = ["derive"] }
