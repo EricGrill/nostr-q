@@ -388,7 +388,7 @@ impl Store {
                 [queue],
                 |r| r.get(0),
             )
-            .unwrap_or(None);
+            ?;
         Ok(QueueStats {
             pending: count("pending")?,
             in_flight: count("claimed")?,
