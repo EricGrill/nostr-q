@@ -1,74 +1,89 @@
 # Nostr-Q
 
-Nostr-Q is an experimental Rust toolkit for message queue, work queue, and
-pub/sub workflows over Nostr relays. The goal is to make Nostr usable where a
-small team might otherwise reach for RabbitMQ, Redis Streams, NATS, SQS, or a
-lightweight internal event bus.
+[![CI](https://github.com/EricGrill/nostr-q/actions/workflows/ci.yml/badge.svg)](https://github.com/EricGrill/nostr-q/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+Nostr-Q turns ordinary Nostr relays into signed message queues, work queues,
+and pub/sub topics. It ships as a Rust SDK plus the `nostr-q` CLI, with local
+SQLite state for claims, retries, traces, and dead-letter records.
+
+It is useful when you want lightweight queue coordination without running a
+central broker: producers, workers, and subscribers exchange signed Nostr
+events through relays you control.
 
 ## Status
 
-This repository is in early MVP development.
+Nostr-Q is pre-1.0 and moving fast. The current MVP includes:
 
-- Implemented today: workspace scaffold, core Nostr-Q event protocol helpers,
-  SQLite state store, relay transport abstraction, `nostr-sdk` transport, mock
-  transport, SDK-level tests for publish, subscribe, claim, ack, nack, retry,
-  and DLQ behavior, plus the initial `nq init` and `nq key` commands.
-- In progress: relay, queue, publish, subscribe, inspect, trace, DLQ, and worker
-  commands in the `nq` CLI and worker runtime.
-- Deferred: `nq dev`, TUI, encryption implementation, request/reply RPC,
-  production relay scoring, and non-SQLite state adapters.
+- Signed queue protocol events for publish, claim, ack, nack, DLQ, and
+  heartbeat.
+- Work queues with at-least-once delivery, lease-bounded claims, retry
+  backoff, and graceful shutdown.
+- Pub/sub topics for best-effort fanout.
+- A SQLite local store for relays, queues, message state, traces, and DLQ
+  records.
+- A `nostr_q` SDK facade for embedding queue behavior in Rust apps.
+- A `nostr-q` CLI for setup, relay management, queue operations, workers,
+  inspection, tracing, and DLQ retry.
 
-Nostr itself is a protocol, not something Nostr-Q installs as a daemon. For
-local development, run a compatible Nostr relay and point Nostr-Q at it. The
-recommended Docker path below uses
-[`nostr-rs-relay`](https://github.com/scsibug/nostr-rs-relay), a Rust relay that
-persists events with SQLite.
+Read the protocol details in [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
-## Requirements
+## Install
 
-- Rust toolchain with Cargo
-- Docker Engine or Docker Desktop for a local relay
-- Optional: `jq` for inspecting relay metadata JSON
+The public command is `nostr-q`.
 
-This workspace uses Rust 2021 and currently pins `nostr` / `nostr-sdk` to
-`0.39`.
+### macOS
 
-## Quick Start
-
-Clone the repository and verify the Rust workspace:
+After the first GitHub release and Homebrew tap setup:
 
 ```sh
-git clone https://github.com/<owner>/nostr-q.git
-cd nostr-q
-
-cargo check --workspace
-cargo test --workspace
+brew install EricGrill/tap/nostr-q
 ```
 
-Inspect the current CLI surface:
+`brew install nq` is intentionally not used. Homebrew Core already owns `nq`
+for an unrelated command-line queue utility, so Nostr-Q publishes the
+unambiguous `nostr-q` binary.
+
+### Linux
+
+After the first GitHub release:
 
 ```sh
-cargo run -p nq -- --help
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/EricGrill/nostr-q/releases/latest/download/nostr-q-cli-installer.sh | sh
 ```
 
-The current executable commands are:
+### Windows
+
+After the first GitHub release:
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/EricGrill/nostr-q/releases/latest/download/nostr-q-cli-installer.ps1 | iex"
+```
+
+Winget and Scoop manifests are good follow-up package targets once the first
+stable release artifacts exist. See [docs/INSTALL.md](docs/INSTALL.md) for
+the full install matrix.
+
+### From Source
 
 ```sh
-cargo run -p nq -- init
-cargo run -p nq -- key generate
-cargo run -p nq -- key show
+cargo install --path crates/nostr-q-cli --locked
+nostr-q --help
 ```
 
-The remaining operational `nq` commands listed later in this README are the
-intended CLI contract for the MVP as the CLI implementation lands.
+Or run without installing:
 
-## Local Nostr Relay With Docker
+```sh
+cargo run -p nostr-q-cli -- --help
+```
 
-Start a local relay on host port `7000`:
+## Local Development Relay
+
+For local development, run a disposable relay in Docker:
 
 ```sh
 mkdir -p .local/nostr-rs-relay
-
 docker run --rm -it \
   --name nostr-q-relay \
   -p 7000:8080 \
@@ -76,161 +91,165 @@ docker run --rm -it \
   scsibug/nostr-rs-relay:latest
 ```
 
-The local relay URL is:
+Then use `ws://localhost:7000` in the quickstart below.
+
+If you prefer a tiny native relay for demos, [`nak`](https://github.com/fiatjaf/nak)
+also works:
+
+```sh
+brew install nak
+nak serve
+```
+
+`nak serve` listens on `ws://localhost:10547`.
+
+## Quick Start
+
+This walkthrough isolates config and state under `/tmp` so it does not touch
+your normal Nostr-Q config.
+
+```sh
+export NOSTR_Q_CONFIG=/tmp/nostrq/config.toml
+export NOSTR_Q_STATE=/tmp/nostrq/state.db
+
+nostr-q init
+nostr-q key generate
+nostr-q relay add ws://localhost:7000
+nostr-q relay health
+
+nostr-q queue create jobs.email --mode work_queue --delivery at_least_once
+nostr-q queue create events.user.created --mode pubsub
+```
+
+Publish and consume a pub/sub event:
+
+```sh
+nostr-q sub events.user.created
+```
+
+In another terminal:
+
+```sh
+export NOSTR_Q_CONFIG=/tmp/nostrq/config.toml
+export NOSTR_Q_STATE=/tmp/nostrq/state.db
+nostr-q pub events.user.created '{"id":7}'
+```
+
+Run a work-queue handler:
+
+```sh
+nostr-q pub jobs.email '{"to":"user@example.com","template":"welcome"}'
+nostr-q worker jobs.email --exec 'cat > /tmp/nostrq/handled.json'
+```
+
+Inspect what happened:
+
+```sh
+nostr-q inspect jobs.email
+nostr-q trace <trace-id>
+nostr-q dlq list
+```
+
+## CLI
 
 ```text
-ws://127.0.0.1:7000
+nostr-q init
+nostr-q key generate|show
+nostr-q relay add|list|remove|health
+nostr-q queue create|list
+nostr-q pub <queue-or-topic> <json>
+nostr-q sub <topic>
+nostr-q worker <queue> --exec <cmd>
+nostr-q worker <queue> --http <url>
+nostr-q inspect <queue>
+nostr-q trace <trace-id-or-message-id>
+nostr-q dlq list|retry
 ```
 
-In another terminal, check the relay information document:
+## Guarantees
 
-```sh
-curl -s \
-  -H 'Accept: application/nostr+json' \
-  http://127.0.0.1:7000 | jq
-```
+- Work queues are **at-least-once**, not exactly-once. Handlers should be
+  idempotent.
+- Pub/sub topics are best-effort and do not use claim/ack tracking.
+- Public relays are fine for demos, but production queue workloads should use
+  private or self-hosted relays with retention and availability you control.
+- Message payloads are plaintext Nostr events today. Do not put secrets in
+  payloads until NIP-04/NIP-44 encryption support lands.
 
-Stop the relay with `Ctrl-C`. Because the command uses `--rm`, Docker removes
-the container after it exits. Relay SQLite data remains in
-`.local/nostr-rs-relay/`.
+## Configuration
 
-To reset the local relay state:
-
-```sh
-rm -rf .local/nostr-rs-relay
-```
-
-## Local Relay Without Docker
-
-If you prefer not to use Docker, build and run `nostr-rs-relay` directly:
-
-```sh
-git clone https://github.com/scsibug/nostr-rs-relay.git
-cd nostr-rs-relay
-cargo run --release
-```
-
-By default, that relay listens on port `8080`, so the local URL is:
-
-```text
-ws://127.0.0.1:8080
-```
-
-Any NIP-01 compatible local relay should work for development. Automated tests
-in this repo use `MockTransport`, so no live relay is required to run the test
-suite.
-
-## Intended `nq` Local Workflow
-
-The `nq init` and `nq key` commands are implemented. The rest describe the MVP
-CLI target and should become executable as the CLI crate is implemented:
-
-```sh
-nq init
-nq key generate
-nq relay add ws://127.0.0.1:7000
-nq relay health
-
-nq queue create jobs.email \
-  --mode work_queue \
-  --delivery at_least_once
-
-nq queue create events.user.created \
-  --mode pubsub \
-  --delivery best_effort
-
-nq pub jobs.email '{"to":"user@example.com","template":"welcome"}'
-nq worker jobs.email --exec './send-email.sh'
-nq sub events.user.created
-nq inspect jobs.email
-nq trace <trace-id>
-nq dlq list
-```
-
-Nostr-Q work queues are at-least-once by default. Duplicate processing is
-possible, so handlers should be idempotent and producers should use idempotency
-keys when the CLI and SDK expose that path.
-
-## Configuration Targets
-
-The planned default locations are:
+Default locations:
 
 - Config: `~/.config/nostr-q/config.toml`
 - Local SQLite state: `~/.local/share/nostr-q/state.db`
 - Project override: `./nostr-q.toml`
-- Environment override prefix: `NQ_`
-- Private key input: `NQ_PRIVATE_KEY` or a key file with restrictive
-  permissions
+- Environment overrides: `NOSTR_Q_CONFIG`, `NOSTR_Q_STATE`,
+  `NOSTR_Q_PRIVATE_KEY`
 
-Example target config:
+Example config:
 
 ```toml
-[profile.default]
-state = "sqlite://~/.local/share/nostr-q/state.db"
-keys = "env:NQ_PRIVATE_KEY"
-
-[[relays]]
-url = "ws://127.0.0.1:7000"
-role = ["publish", "subscribe"]
-
-[queues."jobs.email"]
-mode = "work_queue"
-delivery = "at_least_once"
-encryption = "none"
-max_attempts = 5
-lease_seconds = 60
-
-[queues."events.user.created"]
-mode = "pubsub"
-delivery = "best_effort"
-encryption = "none"
+state = "~/.local/share/nostr-q/state.db"
+key_file = "~/.config/nostr-q/key"
 ```
 
-Never commit private keys or generated local state.
+Never commit private keys, local databases, or relay state.
 
-## Workspace Layout
+## Rust SDK
+
+```rust
+use std::sync::Arc;
+use nostr_q::{NostrQ, relay::NostrTransport, store_crate::Store};
+
+let store = Arc::new(Store::open("state.db".as_ref())?);
+let keys = nostr::Keys::parse(&std::env::var("NOSTR_Q_PRIVATE_KEY")?)?;
+let transport = Arc::new(
+    NostrTransport::connect(keys.clone(), &["wss://relay.example.com".into()]).await?,
+);
+
+let queue = NostrQ::new(keys, store, transport);
+queue
+    .publish("jobs.email", serde_json::json!({"to": "a@b.c"}), None)
+    .await?;
+```
+
+## Repository Layout
 
 ```text
 crates/
   nostr-q-core/    Protocol types, event kinds, tags, IDs, and envelopes
-  nostr-q-store/   SQLite state store for queues, relays, messages, DLQ, traces
+  nostr-q-store/   SQLite state store
   nostr-q-relay/   Transport trait, mock transport, and nostr-sdk transport
-  nostr-q/         SDK facade for publish, subscribe, claim, ack, nack, DLQ
-  nostr-q-worker/  Worker runtime target crate
-  nostr-q-cli/     `nq` CLI target crate
+  nostr-q/         SDK facade
+  nostr-q-worker/  Worker runtime
+  nostr-q-cli/     CLI package, installed as `nostr-q`
+docs/
+  INSTALL.md       Install and package-manager notes
+  PROTOCOL.md      Event kinds, tags, envelopes, and delivery semantics
 ```
 
-Supporting docs:
-
-- [`nostr-q.srs.md`](nostr-q.srs.md): product requirements and roadmap
-- [`docs/superpowers/plans/2026-07-15-nostr-q-mvp.md`](docs/superpowers/plans/2026-07-15-nostr-q-mvp.md):
-  MVP implementation plan
-
-## Development Checks
-
-Run these before opening a pull request:
+## Development
 
 ```sh
 cargo fmt --all -- --check
-cargo check --workspace
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+cargo check --workspace --locked
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
-If a check fails because the CLI or worker runtime is still in progress, keep the
-failure in the pull request notes and link the issue or task that will close the
-gap.
+Automated tests use the in-memory `MockTransport`, so a live relay is not
+required for `cargo test --workspace`.
 
-## Production Notes
+## Contributing
 
-Use private or self-hosted relays for production queue workloads. Public relays
-are useful for experiments and low-criticality public event streams, but they
-should not be the only transport for durable work queues because retention,
-rate limits, moderation policy, and availability are outside your control.
+Issues, bug reports, and pull requests are welcome. Start with
+[CONTRIBUTING.md](CONTRIBUTING.md), and please run the development checks
+before opening a PR.
 
-Nostr-Q v1 messages are signed plaintext by default. Encryption modes are
-modeled in queue config but not implemented yet.
+Security reports should follow [SECURITY.md](SECURITY.md). General usage
+questions belong in GitHub Discussions once the repository is public; see
+[SUPPORT.md](SUPPORT.md).
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).
