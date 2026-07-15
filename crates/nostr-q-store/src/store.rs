@@ -28,13 +28,14 @@ CREATE TABLE IF NOT EXISTS messages (
   event_id TEXT NOT NULL UNIQUE,
   trace_id TEXT NOT NULL,
   envelope_json TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'pending', -- pending | claimed | acked | dead
+  status TEXT NOT NULL DEFAULT 'pending', -- pending | claimed | acked | dead | expired
   attempts INTEGER NOT NULL DEFAULT 0,
   attempt_floor INTEGER NOT NULL DEFAULT 0,
   idem_key TEXT,
   consumer TEXT,
   lease_expires_at INTEGER,
   visible_at INTEGER NOT NULL DEFAULT 0,
+  expires_at INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -72,6 +73,7 @@ pub struct MessageRecord {
     pub attempt_floor: u32,
     pub idem_key: Option<String>,
     pub visible_at: i64,
+    pub expires_at: Option<i64>,
     pub created_at: i64,
 }
 
@@ -99,10 +101,11 @@ pub struct QueueStats {
     pub in_flight: u32,
     pub acked: u32,
     pub dead: u32,
+    pub expired: u32,
     pub oldest_pending_age_secs: Option<i64>,
 }
 
-const MSG_COLS: &str = "mid, queue, event_id, trace_id, envelope_json, status, attempts, attempt_floor, idem_key, visible_at, created_at";
+const MSG_COLS: &str = "mid, queue, event_id, trace_id, envelope_json, status, attempts, attempt_floor, idem_key, visible_at, expires_at, created_at";
 
 fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRecord> {
     Ok(MessageRecord {
@@ -116,7 +119,8 @@ fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRecord> {
         attempt_floor: row.get(7)?,
         idem_key: row.get(8)?,
         visible_at: row.get(9)?,
-        created_at: row.get(10)?,
+        expires_at: row.get(10)?,
+        created_at: row.get(11)?,
     })
 }
 
@@ -244,11 +248,12 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
             "INSERT OR IGNORE INTO messages
-               (mid, queue, event_id, trace_id, envelope_json, status, attempts, attempt_floor, idem_key, visible_at, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+               (mid, queue, event_id, trace_id, envelope_json, status, attempts, attempt_floor, idem_key, visible_at, expires_at, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             rusqlite::params![
                 rec.mid, rec.queue, rec.event_id, rec.trace_id, rec.envelope_json,
-                rec.status, rec.attempts, rec.attempt_floor, rec.idem_key, rec.visible_at, rec.created_at, Self::now()
+                rec.status, rec.attempts, rec.attempt_floor, rec.idem_key, rec.visible_at,
+                rec.expires_at, rec.created_at, Self::now()
             ],
         )?;
         Ok(n == 1)
@@ -278,10 +283,37 @@ impl Store {
                (status = 'pending' AND visible_at <= ?2)
                OR (status = 'claimed' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?2)
              )
+             AND NOT (expires_at IS NOT NULL AND expires_at <= ?2)
              ORDER BY created_at ASC LIMIT ?3"
         ))?;
         let rows = stmt.query_map(rusqlite::params![queue, now, limit], row_to_message)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Find pending/claimed rows on `queue` whose `expires_at` has passed,
+    /// mark them `'expired'` (a terminal status distinct from `'dead'` —
+    /// expiry is a scheduling outcome, not a processing failure, so expired
+    /// messages do NOT go to the DLQ), and return their mids so the caller
+    /// can record a lifecycle event for each.
+    pub fn expire_due(&self, queue: &str, now: i64) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT mid FROM messages
+             WHERE queue = ?1 AND status IN ('pending', 'claimed')
+               AND expires_at IS NOT NULL AND expires_at <= ?2",
+        )?;
+        let mids: Vec<String> = stmt
+            .query_map(rusqlite::params![queue, now], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if !mids.is_empty() {
+            conn.execute(
+                "UPDATE messages SET status='expired', lease_expires_at=NULL, updated_at=?3
+                 WHERE queue = ?1 AND status IN ('pending', 'claimed')
+                   AND expires_at IS NOT NULL AND expires_at <= ?2",
+                rusqlite::params![queue, now, Self::now()],
+            )?;
+        }
+        Ok(mids)
     }
 
     /// Run an UPDATE/INSERT and error if it affected zero rows, naming `mid`
@@ -514,6 +546,7 @@ impl Store {
             in_flight: count("claimed")?,
             acked: count("acked")?,
             dead: count("dead")?,
+            expired: count("expired")?,
             oldest_pending_age_secs: oldest.map(|c| now - c),
         })
     }
@@ -593,6 +626,7 @@ mod tests {
             attempt_floor: 0,
             idem_key: None,
             visible_at: 0,
+            expires_at: None,
             created_at: 100,
         }
     }
@@ -647,6 +681,66 @@ mod tests {
         store.mark_pending("m1", 5000).unwrap();
         assert!(store.claimable("q", 4999, 10).unwrap().is_empty());
         assert_eq!(store.claimable("q", 5000, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn delayed_message_not_claimable_until_visible_at() {
+        let store = Store::open_in_memory().unwrap();
+        let mut m = rec("m1", "q");
+        m.visible_at = 5000; // delayed via nbf
+        store.insert_message(&m).unwrap();
+        assert!(store.claimable("q", 4999, 10).unwrap().is_empty());
+        assert_eq!(store.claimable("q", 5000, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn expired_message_excluded_from_claimable() {
+        let store = Store::open_in_memory().unwrap();
+        let mut m = rec("m1", "q");
+        m.expires_at = Some(5000);
+        store.insert_message(&m).unwrap();
+        assert_eq!(
+            store.claimable("q", 4999, 10).unwrap().len(),
+            1,
+            "not yet expired: claimable"
+        );
+        assert!(
+            store.claimable("q", 5000, 10).unwrap().is_empty(),
+            "expired (expires_at <= now): excluded from claimable"
+        );
+    }
+
+    #[test]
+    fn expire_due_marks_pending_and_claimed_rows_expired_and_returns_mids() {
+        let store = Store::open_in_memory().unwrap();
+        let mut m1 = rec("m1", "q");
+        m1.expires_at = Some(5000);
+        store.insert_message(&m1).unwrap();
+
+        let mut m2 = rec("m2", "q");
+        m2.expires_at = Some(5000);
+        store.insert_message(&m2).unwrap();
+        store.mark_claimed("m2", "pk", 6000, 0).unwrap(); // claimed, still expires
+
+        let mut m3 = rec("m3", "q");
+        m3.expires_at = Some(9999); // not due yet
+        store.insert_message(&m3).unwrap();
+
+        // not due yet at now=4000
+        assert!(store.expire_due("q", 4000).unwrap().is_empty());
+
+        let mut expired = store.expire_due("q", 5000).unwrap();
+        expired.sort();
+        assert_eq!(expired, vec!["m1".to_string(), "m2".to_string()]);
+        assert_eq!(store.get_message("m1").unwrap().unwrap().status, "expired");
+        assert_eq!(store.get_message("m2").unwrap().unwrap().status, "expired");
+        assert_eq!(store.get_message("m3").unwrap().unwrap().status, "pending");
+
+        // idempotent: already-expired rows aren't returned again
+        assert!(store.expire_due("q", 5000).unwrap().is_empty());
+
+        let stats = store.stats("q", 5000).unwrap();
+        assert_eq!(stats.expired, 2);
     }
 
     #[test]

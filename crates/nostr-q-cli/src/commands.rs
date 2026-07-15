@@ -288,12 +288,67 @@ pub fn queue_list(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+/// Parse a simple duration string like `30s`, `5m`, `2h`, `1d` (a bare
+/// integer with no suffix is treated as seconds) into a whole number of
+/// seconds.
+fn parse_duration_secs(s: &str) -> Result<i64> {
+    let s = s.trim();
+    anyhow::ensure!(!s.is_empty(), "duration must not be empty");
+    let (num_str, mult): (&str, i64) = match s.chars().last() {
+        Some(c) if c.is_ascii_digit() => (s, 1),
+        Some('s') => (&s[..s.len() - 1], 1),
+        Some('m') => (&s[..s.len() - 1], 60),
+        Some('h') => (&s[..s.len() - 1], 3600),
+        Some('d') => (&s[..s.len() - 1], 86400),
+        _ => anyhow::bail!("invalid duration '{s}' — use a number optionally suffixed with s/m/h/d (e.g. 30s, 5m, 2h)"),
+    };
+    let n: i64 = num_str
+        .parse()
+        .with_context(|| format!("invalid duration '{s}'"))?;
+    anyhow::ensure!(n >= 0, "duration must not be negative: '{s}'");
+    Ok(n * mult)
+}
+
+/// Parse an RFC3339 timestamp into unix seconds.
+fn parse_rfc3339_secs(s: &str) -> Result<i64> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.timestamp())
+        .with_context(|| format!("invalid RFC3339 timestamp '{s}'"))
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn publish(
     ctx: &Ctx,
     queue: &str,
     payload: Option<String>,
     idem: Option<String>,
+    delay: Option<String>,
+    not_before: Option<String>,
+    ttl: Option<String>,
+    expires: Option<String>,
 ) -> Result<()> {
+    anyhow::ensure!(
+        !(delay.is_some() && not_before.is_some()),
+        "--delay and --not-before are mutually exclusive"
+    );
+    anyhow::ensure!(
+        !(ttl.is_some() && expires.is_some()),
+        "--ttl and --expires are mutually exclusive"
+    );
+    let now = chrono::Utc::now().timestamp();
+    let opt_not_before = match (delay, not_before) {
+        (Some(d), None) => Some(now + parse_duration_secs(&d)?),
+        (None, Some(t)) => Some(parse_rfc3339_secs(&t)?),
+        (None, None) => None,
+        (Some(_), Some(_)) => unreachable!("checked above"),
+    };
+    let opt_expires_at = match (ttl, expires) {
+        (Some(d), None) => Some(now + parse_duration_secs(&d)?),
+        (None, Some(t)) => Some(parse_rfc3339_secs(&t)?),
+        (None, None) => None,
+        (Some(_), Some(_)) => unreachable!("checked above"),
+    };
+
     let raw = match payload {
         Some(p) => p,
         None => {
@@ -313,7 +368,17 @@ pub async fn publish(
     let body: serde_json::Value =
         serde_json::from_str(&raw).context("payload must be valid JSON")?;
     let nq = ctx.connect().await?;
-    let receipt = nq.publish(queue, body, idem).await?;
+    let receipt = nq
+        .publish_opts(
+            queue,
+            body,
+            idem,
+            nostr_q::PublishOptions {
+                not_before: opt_not_before,
+                expires_at: opt_expires_at,
+            },
+        )
+        .await?;
     if ctx.json {
         println!("{}", serde_json::to_string(&receipt)?);
     } else {
@@ -428,6 +493,7 @@ pub fn inspect(ctx: &Ctx, queue: &str) -> Result<()> {
         println!("in-flight:        {}", stats.in_flight);
         println!("acked:            {}", stats.acked);
         println!("dead-lettered:    {}", stats.dead);
+        println!("expired:          {}", stats.expired);
         match stats.oldest_pending_age_secs {
             Some(age) => println!("oldest pending:   {age}s"),
             None => println!("oldest pending:   -"),
@@ -663,6 +729,7 @@ mod tests {
             attempt_floor: 0,
             idem_key: None,
             visible_at: 0,
+            expires_at: None,
             created_at: 0,
         };
         ctx.store.insert_message(&rec).unwrap();
@@ -689,10 +756,103 @@ mod tests {
     async fn publish_rejects_non_json_payload() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = test_ctx(dir.path().join("key"));
-        let err = publish(&ctx, "q", Some("not json".into()), None)
-            .await
-            .expect_err("non-JSON payload must be rejected before connecting to any relay");
+        let err = publish(
+            &ctx,
+            "q",
+            Some("not json".into()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("non-JSON payload must be rejected before connecting to any relay");
         assert!(err.to_string().contains("JSON"), "{err}");
+    }
+
+    // --- delayed delivery / TTL flag validation (CHA-2345) ---
+    //
+    // These checks happen before `publish` touches JSON parsing or connects
+    // to any relay, so a plain in-memory ctx with a bogus payload still
+    // reaches (and fails on) the flag validation first.
+
+    #[tokio::test]
+    async fn publish_rejects_delay_and_not_before_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path().join("key"));
+        let err = publish(
+            &ctx,
+            "q",
+            Some("{}".into()),
+            None,
+            Some("30s".into()),
+            Some("2030-01-01T00:00:00Z".into()),
+            None,
+            None,
+        )
+        .await
+        .expect_err("--delay and --not-before must be mutually exclusive");
+        assert!(err.to_string().contains("mutually exclusive"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn publish_rejects_ttl_and_expires_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path().join("key"));
+        let err = publish(
+            &ctx,
+            "q",
+            Some("{}".into()),
+            None,
+            None,
+            None,
+            Some("5m".into()),
+            Some("2030-01-01T00:00:00Z".into()),
+        )
+        .await
+        .expect_err("--ttl and --expires must be mutually exclusive");
+        assert!(err.to_string().contains("mutually exclusive"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn publish_rejects_invalid_delay_duration() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path().join("key"));
+        let err = publish(
+            &ctx,
+            "q",
+            Some("{}".into()),
+            None,
+            Some("not-a-duration".into()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("garbage duration must be rejected before connecting to any relay");
+        assert!(err.to_string().contains("duration"), "{err}");
+    }
+
+    #[test]
+    fn parse_duration_secs_handles_units_and_bare_numbers() {
+        assert_eq!(parse_duration_secs("30s").unwrap(), 30);
+        assert_eq!(parse_duration_secs("5m").unwrap(), 300);
+        assert_eq!(parse_duration_secs("2h").unwrap(), 7200);
+        assert_eq!(parse_duration_secs("1d").unwrap(), 86400);
+        assert_eq!(parse_duration_secs("45").unwrap(), 45);
+        assert!(parse_duration_secs("").is_err());
+        assert!(parse_duration_secs("-5s").is_err());
+        assert!(parse_duration_secs("5x").is_err());
+    }
+
+    #[test]
+    fn parse_rfc3339_secs_parses_valid_timestamps_and_rejects_garbage() {
+        assert_eq!(
+            parse_rfc3339_secs("2021-11-07T09:00:00Z").unwrap(),
+            1636275600
+        );
+        assert!(parse_rfc3339_secs("not-a-timestamp").is_err());
     }
 
     // The exact `--json` wire format for init/key/relay/queue is verified

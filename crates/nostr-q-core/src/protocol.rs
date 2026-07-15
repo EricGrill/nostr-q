@@ -30,6 +30,15 @@ pub struct NqMessage {
     pub attempt: u32,
     pub idem: Option<String>,
     pub envelope: Envelope,
+    /// Not-before (unix seconds): the message is not claimable until this
+    /// time. `None` means immediately claimable (the default). Carried on
+    /// the wire as the `nbf` tag (SRS §11.3 reserves `exp`; `nbf` mirrors
+    /// it for delayed delivery).
+    pub not_before: Option<i64>,
+    /// Expiry (unix seconds): the message must not be claimed once this
+    /// time has passed. `None` means the message never expires. Carried on
+    /// the wire as the reserved `exp` tag (SRS §11.3).
+    pub expires_at: Option<i64>,
 }
 
 fn custom_tag(name: &str, value: impl Into<String>) -> Tag {
@@ -79,6 +88,12 @@ pub fn build_message_event(
     if let Some(idem) = &msg.idem {
         tags.push(custom_tag("idem", idem));
     }
+    if let Some(nbf) = msg.not_before {
+        tags.push(custom_tag("nbf", nbf.to_string()));
+    }
+    if let Some(exp) = msg.expires_at {
+        tags.push(custom_tag("exp", exp.to_string()));
+    }
     sign(
         EventBuilder::new(Kind::Custom(KIND_MESSAGE), content).tags(tags),
         keys,
@@ -97,6 +112,8 @@ pub fn parse_message_event(event: &Event) -> Result<NqMessage, ProtocolError> {
             .unwrap_or(0),
         idem: tag_value(event, "idem"),
         envelope,
+        not_before: tag_value(event, "nbf").and_then(|v| v.parse().ok()),
+        expires_at: tag_value(event, "exp").and_then(|v| v.parse().ok()),
     })
 }
 
@@ -245,6 +262,8 @@ mod tests {
             attempt: 0,
             idem: Some("order-42".into()),
             envelope: Envelope::new(json!({"to": "a@b.c"})),
+            not_before: None,
+            expires_at: None,
         }
     }
 
@@ -261,6 +280,32 @@ mod tests {
         assert_eq!(parsed.queue, "jobs.email");
         assert_eq!(parsed.idem.as_deref(), Some("order-42"));
         assert_eq!(parsed.envelope.body, msg.envelope.body);
+    }
+
+    #[test]
+    fn message_event_carries_nbf_and_exp_tags_when_set() {
+        let keys = Keys::generate();
+        let mut msg = sample_msg();
+        msg.not_before = Some(1_700_000_100);
+        msg.expires_at = Some(1_700_003_600);
+        let event = build_message_event(&keys, QueueMode::WorkQueue, &msg).unwrap();
+        assert_eq!(tag_value(&event, "nbf").as_deref(), Some("1700000100"));
+        assert_eq!(tag_value(&event, "exp").as_deref(), Some("1700003600"));
+        let parsed = parse_message_event(&event).unwrap();
+        assert_eq!(parsed.not_before, Some(1_700_000_100));
+        assert_eq!(parsed.expires_at, Some(1_700_003_600));
+    }
+
+    #[test]
+    fn message_event_omits_nbf_and_exp_tags_by_default() {
+        let keys = Keys::generate();
+        let msg = sample_msg();
+        let event = build_message_event(&keys, QueueMode::WorkQueue, &msg).unwrap();
+        assert!(tag_value(&event, "nbf").is_none());
+        assert!(tag_value(&event, "exp").is_none());
+        let parsed = parse_message_event(&event).unwrap();
+        assert_eq!(parsed.not_before, None);
+        assert_eq!(parsed.expires_at, None);
     }
 
     #[test]

@@ -119,6 +119,16 @@ pub async fn run_worker(
     }
 
     while !shutdown.is_cancelled() {
+        // Enforce TTL for every message on the queue once per poll cycle,
+        // not just ones that happen to get claimed — `try_claim`'s own TTL
+        // check only fires for rows a worker actually surveys, so a message
+        // that never gets claimed (e.g. the queue sits idle, or every
+        // worker is busy) would otherwise never leave `pending` once its
+        // expiry passes.
+        if let Err(e) = nq.sweep_expired(&queue).await {
+            tracing::warn!(queue = %queue, error = %e, "sweep_expired failed");
+        }
+
         let now = chrono::Utc::now().timestamp();
         let batch = nq.store().claimable(&queue, now, opts.concurrency as u32)?;
         if batch.is_empty() {
@@ -566,6 +576,74 @@ mod tests {
         assert_eq!(
             generation, 2,
             "raw generation must still reflect full history for handlers that want it"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_sweeps_expired_messages_without_running_handler() {
+        use nostr_q::PublishOptions;
+
+        let nq = make_nq();
+        let past = chrono::Utc::now().timestamp() - 10;
+        let receipt = nq
+            .publish_opts(
+                "jobs.email",
+                json!({"n": 1}),
+                None,
+                PublishOptions {
+                    not_before: None,
+                    expires_at: Some(past),
+                },
+            )
+            .await
+            .unwrap();
+
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let shutdown = CancellationToken::new();
+        let opts = WorkerOptions {
+            concurrency: 1,
+            lease_seconds: 60,
+            heartbeat_seconds: 3600,
+            settle_ms: 10,
+            poll_ms: 50,
+        };
+        let handle = tokio::spawn(run_worker(
+            nq.clone(),
+            "jobs.email".into(),
+            Arc::new(CountingHandler {
+                calls: calls.clone(),
+            }),
+            opts,
+            shutdown.clone(),
+        ));
+
+        let mut expired = false;
+        for _ in 0..100 {
+            if nq
+                .store()
+                .get_message(&receipt.mid)
+                .unwrap()
+                .unwrap()
+                .status
+                == "expired"
+            {
+                expired = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        // give any (incorrect) handler dispatch a moment to fire before shutdown
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        shutdown.cancel();
+        handle.await.unwrap().unwrap();
+        assert!(
+            expired,
+            "worker's per-poll sweep must expire a never-claimed message once its TTL passes"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an expired message must never reach the handler"
         );
     }
 

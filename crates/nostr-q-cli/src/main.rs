@@ -48,6 +48,22 @@ enum Cmd {
         /// Idempotency key (duplicate keys on a queue are dropped)
         #[arg(long)]
         idem: Option<String>,
+        /// Delay delivery by a duration (e.g. 30s, 5m, 2h) — mutually
+        /// exclusive with --not-before
+        #[arg(long, conflicts_with = "not_before")]
+        delay: Option<String>,
+        /// Delay delivery until an RFC3339 timestamp — mutually exclusive
+        /// with --delay
+        #[arg(long)]
+        not_before: Option<String>,
+        /// Expire (become unclaimable) after a duration from now (e.g.
+        /// 30s, 5m, 2h) — mutually exclusive with --expires
+        #[arg(long, conflicts_with = "expires")]
+        ttl: Option<String>,
+        /// Expire (become unclaimable) at an RFC3339 timestamp — mutually
+        /// exclusive with --ttl
+        #[arg(long)]
+        expires: Option<String>,
     },
     /// Subscribe to a pub/sub topic and print events
     Sub { topic: String },
@@ -188,9 +204,13 @@ async fn main() -> anyhow::Result<()> {
             queue,
             payload,
             idem,
+            delay,
+            not_before,
+            ttl,
+            expires,
         } => {
             let ctx = Ctx::load(cli.config, cli.json)?;
-            commands::publish(&ctx, &queue, payload, idem).await
+            commands::publish(&ctx, &queue, payload, idem, delay, not_before, ttl, expires).await
         }
         Cmd::Sub { topic } => {
             let ctx = Ctx::load(cli.config, cli.json)?;
