@@ -279,10 +279,28 @@ impl Store {
         Ok(())
     }
 
-    pub fn mark_claimed(&self, mid: &str, consumer: &str, lease_expires_at: i64) -> Result<()> {
+    /// Mark a message claimed by `consumer`, healing the local `attempts`
+    /// counter up to `attempt` in the process.
+    ///
+    /// The winning claim's `attempt` is the globally observed retry
+    /// generation (see `try_claim`'s `claim_attempt`), which may be ahead of
+    /// this worker's own local counter when another worker advanced the
+    /// generation first. Persisting `MAX(attempts, attempt)` here keeps this
+    /// worker's counter in sync with the generation it just won, so that if
+    /// this worker goes on to nack the message, `incr_attempts` advances the
+    /// generation forward instead of colliding with (or trailing behind) the
+    /// claim it just made.
+    pub fn mark_claimed(
+        &self,
+        mid: &str,
+        consumer: &str,
+        lease_expires_at: i64,
+        attempt: u32,
+    ) -> Result<()> {
         self.update(
-            "UPDATE messages SET status='claimed', consumer=?2, lease_expires_at=?3, updated_at=?4 WHERE mid=?1",
-            rusqlite::params![mid, consumer, lease_expires_at, Self::now()],
+            "UPDATE messages SET status='claimed', consumer=?2, lease_expires_at=?3, \
+             attempts = MAX(attempts, ?4), updated_at=?5 WHERE mid=?1",
+            rusqlite::params![mid, consumer, lease_expires_at, attempt, Self::now()],
         )
     }
 
@@ -512,12 +530,17 @@ mod tests {
 
         let claimable = store.claimable("q", 1000, 10).unwrap();
         assert_eq!(claimable.len(), 1);
-        store.mark_claimed("m1", "pubkey-a", 2000).unwrap();
+        store.mark_claimed("m1", "pubkey-a", 2000, 0).unwrap();
         assert!(store.claimable("q", 1000, 10).unwrap().is_empty()); // lease active
         assert_eq!(store.claimable("q", 2001, 10).unwrap().len(), 1); // lease expired -> reclaimable
         store.mark_acked("m1").unwrap();
         assert!(store.claimable("q", 3000, 10).unwrap().is_empty());
         assert_eq!(store.get_message("m1").unwrap().unwrap().status, "acked");
+
+        // mark_claimed heals the local attempts counter to the claim's generation
+        assert!(store.insert_message(&rec("m2", "q")).unwrap());
+        store.mark_claimed("m2", "pk", 2000, 3).unwrap();
+        assert_eq!(store.get_message("m2").unwrap().unwrap().attempts, 3);
     }
 
     #[test]

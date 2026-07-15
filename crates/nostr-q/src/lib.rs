@@ -205,7 +205,7 @@ impl NostrQ {
         if we_won {
             let consumer = self.keys.public_key().to_hex();
             self.store
-                .mark_claimed(&rec.mid, &consumer, lease_expires_at)?;
+                .mark_claimed(&rec.mid, &consumer, lease_expires_at, claim_attempt)?;
             self.store
                 .record_lifecycle(&rec.mid, &rec.trace_id, "claimed", &consumer)?;
         }
@@ -601,6 +601,61 @@ mod tests {
         assert!(
             w2.try_claim(&r2, 60, 10).await.unwrap(),
             "a worker that never nacked must not be locked out after a foreign nack"
+        );
+    }
+
+    #[tokio::test]
+    async fn takeover_worker_retry_wins_after_its_own_nack() {
+        let transport = Arc::new(MockTransport::new());
+        let mk = |t: Arc<MockTransport>| {
+            let store = Arc::new(Store::open_in_memory().unwrap());
+            store
+                .upsert_queue(&QueueConfig::work_queue("jobs.email"))
+                .unwrap();
+            NostrQ::new(Keys::generate(), store, t)
+        };
+        let producer = mk(transport.clone());
+        let w1 = mk(transport.clone());
+        let w2 = mk(transport.clone());
+        let _i1 = w1.spawn_ingest("jobs.email").await.unwrap();
+        let _i2 = w2.spawn_ingest("jobs.email").await.unwrap();
+        let receipt = producer
+            .publish("jobs.email", json!({"n": 1}), None)
+            .await
+            .unwrap();
+        for w in [&w1, &w2] {
+            for _ in 0..40 {
+                if w.store().get_message(&receipt.mid).unwrap().is_some() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+
+        // generation 0: w1 claims and nacks (global generation -> 1)
+        let r1 = w1.store().get_message(&receipt.mid).unwrap().unwrap();
+        assert!(w1.try_claim(&r1, 60, 10).await.unwrap());
+        w1.nack(&receipt.mid, "boom").await.unwrap();
+
+        // generation 1: w2 takes over, then nacks (its healed counter -> 2)
+        let r2 = w2.store().get_message(&receipt.mid).unwrap().unwrap();
+        assert!(w2.try_claim(&r2, 60, 10).await.unwrap());
+        assert_eq!(
+            w2.store()
+                .get_message(&receipt.mid)
+                .unwrap()
+                .unwrap()
+                .attempts,
+            1,
+            "claim must heal the local counter"
+        );
+        w2.nack(&receipt.mid, "boom again").await.unwrap();
+
+        // generation 2: w2's own retry must beat its stale generation-1 claim
+        let r2 = w2.store().get_message(&receipt.mid).unwrap().unwrap();
+        assert!(
+            w2.try_claim(&r2, 60, 10).await.unwrap(),
+            "takeover worker's retry must not lose to its own stale claim"
         );
     }
 
