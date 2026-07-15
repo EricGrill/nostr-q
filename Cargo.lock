@@ -674,6 +674,7 @@ dependencies = [
  "chrono",
  "nostr-q-core",
  "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
 ]

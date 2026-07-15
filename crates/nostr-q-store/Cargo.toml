@@ -8,6 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 rusqlite.workspace = true
 chrono.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 nostr-q-core.workspace = true
 

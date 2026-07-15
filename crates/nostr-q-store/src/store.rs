@@ -5,6 +5,7 @@ use std::sync::Mutex;
 use anyhow::{Context, Result};
 use nostr_q_core::queue::{Delivery, Encryption, QueueConfig, QueueMode};
 use rusqlite::Connection;
+use serde::Serialize;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS queues (
@@ -57,6 +58,65 @@ CREATE TABLE IF NOT EXISTS lifecycle (
 CREATE INDEX IF NOT EXISTS idx_lifecycle_trace ON lifecycle(trace_id);
 CREATE INDEX IF NOT EXISTS idx_lifecycle_mid ON lifecycle(mid);
 "#;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MessageRecord {
+    pub mid: String,
+    pub queue: String,
+    pub event_id: String,
+    pub trace_id: String,
+    pub envelope_json: String,
+    pub status: String,
+    pub attempts: u32,
+    pub idem_key: Option<String>,
+    pub visible_at: i64,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DlqRecord {
+    pub mid: String,
+    pub queue: String,
+    pub reason: String,
+    pub attempts: u32,
+    pub dead_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LifecycleRecord {
+    pub mid: String,
+    pub trace_id: String,
+    pub kind: String,
+    pub detail: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct QueueStats {
+    pub pending: u32,
+    pub in_flight: u32,
+    pub acked: u32,
+    pub dead: u32,
+    pub oldest_pending_age_secs: Option<i64>,
+}
+
+const MSG_COLS: &str =
+    "mid, queue, event_id, trace_id, envelope_json, status, attempts, idem_key, visible_at, created_at";
+
+fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRecord> {
+    Ok(MessageRecord {
+        mid: row.get(0)?,
+        queue: row.get(1)?,
+        event_id: row.get(2)?,
+        trace_id: row.get(3)?,
+        envelope_json: row.get(4)?,
+        status: row.get(5)?,
+        attempts: row.get(6)?,
+        idem_key: row.get(7)?,
+        visible_at: row.get(8)?,
+        created_at: row.get(9)?,
+    })
+}
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -164,6 +224,180 @@ impl Store {
         Ok(())
     }
 
+    pub fn insert_message(&self, rec: &MessageRecord) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "INSERT OR IGNORE INTO messages
+               (mid, queue, event_id, trace_id, envelope_json, status, attempts, idem_key, visible_at, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            rusqlite::params![
+                rec.mid, rec.queue, rec.event_id, rec.trace_id, rec.envelope_json,
+                rec.status, rec.attempts, rec.idem_key, rec.visible_at, rec.created_at, Self::now()
+            ],
+        )?;
+        Ok(n == 1)
+    }
+
+    pub fn get_message(&self, mid: &str) -> Result<Option<MessageRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare(&format!("SELECT {MSG_COLS} FROM messages WHERE mid = ?1"))?;
+        let mut rows = stmt.query_map([mid], row_to_message)?;
+        Ok(rows.next().transpose()?)
+    }
+
+    pub fn claimable(&self, queue: &str, now: i64, limit: u32) -> Result<Vec<MessageRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {MSG_COLS} FROM messages
+             WHERE queue = ?1 AND (
+               (status = 'pending' AND visible_at <= ?2)
+               OR (status = 'claimed' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?2)
+             )
+             ORDER BY created_at ASC LIMIT ?3"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params![queue, now, limit], row_to_message)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    fn update(&self, sql: &str, params: impl rusqlite::Params) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(sql, params)?;
+        Ok(())
+    }
+
+    pub fn mark_claimed(&self, mid: &str, consumer: &str, lease_expires_at: i64) -> Result<()> {
+        self.update(
+            "UPDATE messages SET status='claimed', consumer=?2, lease_expires_at=?3, updated_at=?4 WHERE mid=?1",
+            rusqlite::params![mid, consumer, lease_expires_at, Self::now()],
+        )
+    }
+
+    pub fn mark_acked(&self, mid: &str) -> Result<()> {
+        self.update(
+            "UPDATE messages SET status='acked', lease_expires_at=NULL, updated_at=?2 WHERE mid=?1",
+            rusqlite::params![mid, Self::now()],
+        )
+    }
+
+    pub fn mark_pending(&self, mid: &str, visible_at: i64) -> Result<()> {
+        self.update(
+            "UPDATE messages SET status='pending', lease_expires_at=NULL, visible_at=?2, updated_at=?3 WHERE mid=?1",
+            rusqlite::params![mid, visible_at, Self::now()],
+        )
+    }
+
+    pub fn incr_attempts(&self, mid: &str) -> Result<u32> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE messages SET attempts = attempts + 1, updated_at=?2 WHERE mid=?1",
+            rusqlite::params![mid, Self::now()],
+        )?;
+        Ok(conn.query_row("SELECT attempts FROM messages WHERE mid=?1", [mid], |r| r.get(0))?)
+    }
+
+    pub fn move_to_dlq(&self, mid: &str, reason: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE messages SET status='dead', lease_expires_at=NULL, updated_at=?2 WHERE mid=?1",
+            rusqlite::params![mid, Self::now()],
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO dlq (mid, queue, reason, attempts, dead_at)
+             SELECT mid, queue, ?2, attempts, ?3 FROM messages WHERE mid=?1",
+            rusqlite::params![mid, reason, Self::now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn dlq_list(&self, queue: Option<&str>) -> Result<Vec<DlqRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let map = |row: &rusqlite::Row<'_>| -> rusqlite::Result<DlqRecord> {
+            Ok(DlqRecord {
+                mid: row.get(0)?, queue: row.get(1)?, reason: row.get(2)?,
+                attempts: row.get(3)?, dead_at: row.get(4)?,
+            })
+        };
+        let sql_all = "SELECT mid, queue, reason, attempts, dead_at FROM dlq ORDER BY dead_at";
+        let sql_q = "SELECT mid, queue, reason, attempts, dead_at FROM dlq WHERE queue=?1 ORDER BY dead_at";
+        let out = match queue {
+            Some(q) => {
+                let mut stmt = conn.prepare(sql_q)?;
+                let rows = stmt.query_map([q], map)?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            }
+            None => {
+                let mut stmt = conn.prepare(sql_all)?;
+                let rows = stmt.query_map([], map)?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            }
+        };
+        Ok(out)
+    }
+
+    pub fn dlq_retry(&self, mid: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE messages SET status='pending', attempts=0, visible_at=0, lease_expires_at=NULL, updated_at=?2 WHERE mid=?1",
+            rusqlite::params![mid, Self::now()],
+        )?;
+        conn.execute("DELETE FROM dlq WHERE mid=?1", [mid])?;
+        Ok(())
+    }
+
+    pub fn record_lifecycle(&self, mid: &str, trace_id: &str, kind: &str, detail: &str) -> Result<()> {
+        self.update(
+            "INSERT INTO lifecycle (mid, trace_id, kind, detail, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![mid, trace_id, kind, detail, Self::now()],
+        )
+    }
+
+    pub fn trace(&self, trace_id: &str) -> Result<Vec<LifecycleRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT mid, trace_id, kind, detail, created_at FROM lifecycle WHERE trace_id=?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map([trace_id], |row| {
+            Ok(LifecycleRecord {
+                mid: row.get(0)?, trace_id: row.get(1)?, kind: row.get(2)?,
+                detail: row.get(3)?, created_at: row.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn trace_id_for_mid(&self, mid: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT trace_id FROM messages WHERE mid=?1")?;
+        let mut rows = stmt.query_map([mid], |r| r.get(0))?;
+        Ok(rows.next().transpose()?)
+    }
+
+    pub fn stats(&self, queue: &str, now: i64) -> Result<QueueStats> {
+        let conn = self.conn.lock().unwrap();
+        let count = |status: &str| -> rusqlite::Result<u32> {
+            conn.query_row(
+                "SELECT COUNT(*) FROM messages WHERE queue=?1 AND status=?2",
+                rusqlite::params![queue, status],
+                |r| r.get(0),
+            )
+        };
+        let oldest: Option<i64> = conn
+            .query_row(
+                "SELECT MIN(created_at) FROM messages WHERE queue=?1 AND status='pending'",
+                [queue],
+                |r| r.get(0),
+            )
+            .unwrap_or(None);
+        Ok(QueueStats {
+            pending: count("pending")?,
+            in_flight: count("claimed")?,
+            acked: count("acked")?,
+            dead: count("dead")?,
+            oldest_pending_age_secs: oldest.map(|c| now - c),
+        })
+    }
+
     pub(crate) fn now() -> i64 {
         chrono::Utc::now().timestamp()
     }
@@ -217,5 +451,92 @@ mod tests {
         assert_eq!(store.list_relays().unwrap(), vec!["wss://relay.example.com".to_string()]);
         store.remove_relay("wss://relay.example.com").unwrap();
         assert!(store.list_relays().unwrap().is_empty());
+    }
+
+    fn rec(mid: &str, queue: &str) -> MessageRecord {
+        MessageRecord {
+            mid: mid.into(),
+            queue: queue.into(),
+            event_id: format!("ev-{mid}"),
+            trace_id: format!("tr-{mid}"),
+            envelope_json: "{}".into(),
+            status: "pending".into(),
+            attempts: 0,
+            idem_key: None,
+            visible_at: 0,
+            created_at: 100,
+        }
+    }
+
+    #[test]
+    fn message_lifecycle_pending_claim_ack() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(store.insert_message(&rec("m1", "q")).unwrap());
+        assert!(!store.insert_message(&rec("m1", "q")).unwrap()); // dup event_id ignored
+
+        let claimable = store.claimable("q", 1000, 10).unwrap();
+        assert_eq!(claimable.len(), 1);
+        store.mark_claimed("m1", "pubkey-a", 2000).unwrap();
+        assert!(store.claimable("q", 1000, 10).unwrap().is_empty()); // lease active
+        assert_eq!(store.claimable("q", 2001, 10).unwrap().len(), 1); // lease expired -> reclaimable
+        store.mark_acked("m1").unwrap();
+        assert!(store.claimable("q", 3000, 10).unwrap().is_empty());
+        assert_eq!(store.get_message("m1").unwrap().unwrap().status, "acked");
+    }
+
+    #[test]
+    fn idempotency_key_dedupes() {
+        let store = Store::open_in_memory().unwrap();
+        let mut a = rec("m1", "q");
+        a.idem_key = Some("order-42".into());
+        let mut b = rec("m2", "q");
+        b.idem_key = Some("order-42".into());
+        assert!(store.insert_message(&a).unwrap());
+        assert!(!store.insert_message(&b).unwrap());
+    }
+
+    #[test]
+    fn visible_at_defers_retry() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert_message(&rec("m1", "q")).unwrap();
+        store.mark_pending("m1", 5000).unwrap();
+        assert!(store.claimable("q", 4999, 10).unwrap().is_empty());
+        assert_eq!(store.claimable("q", 5000, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn dlq_flow() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert_message(&rec("m1", "q")).unwrap();
+        assert_eq!(store.incr_attempts("m1").unwrap(), 1);
+        assert_eq!(store.incr_attempts("m1").unwrap(), 2);
+        store.move_to_dlq("m1", "handler exit 1").unwrap();
+        assert!(store.claimable("q", 9999, 10).unwrap().is_empty());
+        let dlq = store.dlq_list(Some("q")).unwrap();
+        assert_eq!(dlq.len(), 1);
+        assert_eq!(dlq[0].reason, "handler exit 1");
+        assert_eq!(dlq[0].attempts, 2);
+        store.dlq_retry("m1").unwrap();
+        assert!(store.dlq_list(None).unwrap().is_empty());
+        let m = store.get_message("m1").unwrap().unwrap();
+        assert_eq!(m.status, "pending");
+        assert_eq!(m.attempts, 0);
+    }
+
+    #[test]
+    fn trace_and_stats() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert_message(&rec("m1", "q")).unwrap();
+        store.record_lifecycle("m1", "tr-m1", "published", "q").unwrap();
+        store.record_lifecycle("m1", "tr-m1", "claimed", "pubkey-a").unwrap();
+        let t = store.trace("tr-m1").unwrap();
+        assert_eq!(t.len(), 2);
+        assert_eq!(t[0].kind, "published");
+        assert_eq!(store.trace_id_for_mid("m1").unwrap().as_deref(), Some("tr-m1"));
+
+        let stats = store.stats("q", 200).unwrap();
+        assert_eq!(stats.pending, 1);
+        assert_eq!(stats.in_flight, 0);
+        assert_eq!(stats.oldest_pending_age_secs, Some(100)); // created_at=100, now=200
     }
 }
