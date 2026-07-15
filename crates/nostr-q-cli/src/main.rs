@@ -6,12 +6,12 @@ use commands::Ctx;
 
 #[derive(Parser)]
 #[command(
-    name = "nq",
+    name = "nostr-q",
     version,
     about = "Nostr-Q: message queues and pub/sub over Nostr relays"
 )]
 struct Cli {
-    /// Config file path (default: $NQ_CONFIG, ./nostr-q.toml, ~/.config/nostr-q/config.toml)
+    /// Config file path (default: $NOSTR_Q_CONFIG, ./nostr-q.toml, ~/.config/nostr-q/config.toml)
     #[arg(long, global = true)]
     config: Option<std::path::PathBuf>,
     /// Emit machine-readable JSON

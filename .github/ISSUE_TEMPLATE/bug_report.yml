@@ -1,0 +1,54 @@
+name: Bug report
+description: Report reproducible broken behavior.
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction
+      description: Include commands, config, and relay setup.
+      placeholder: |
+        1. Run `nostr-q ...`
+        2. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: v0.1.0 or git sha
+    validations:
+      required: true
+  - type: dropdown
+    id: relay
+    attributes:
+      label: Relay type
+      options:
+        - Local Docker relay
+        - Local non-Docker relay
+        - Private/self-hosted relay
+        - Public relay
+        - MockTransport/tests only
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Remove private keys and secrets before posting.
+      render: text

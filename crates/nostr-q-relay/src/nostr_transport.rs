@@ -17,7 +17,7 @@ impl NostrTransport {
     pub async fn connect(keys: Keys, relays: &[String]) -> anyhow::Result<Self> {
         anyhow::ensure!(
             !relays.is_empty(),
-            "no relays configured — run `nq relay add <url>` first"
+            "no relays configured - run `nostr-q relay add <url>` first"
         );
         let client = Client::new(keys);
         for url in relays {

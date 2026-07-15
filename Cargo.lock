@@ -1293,6 +1293,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "nostr-q-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "dirs",
+ "nostr",
+ "nostr-q",
+ "nostr-q-worker",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "nostr-q-core"
 version = "0.1.0"
 dependencies = [
@@ -1378,27 +1399,6 @@ dependencies = [
  "nostr-relay-pool",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "nq"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "dirs",
- "nostr",
- "nostr-q",
- "nostr-q-worker",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-util",
- "toml",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

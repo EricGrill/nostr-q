@@ -13,6 +13,10 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+authors = ["Eric Grill"]
+repository = "https://github.com/EricGrill/nostr-q"
+homepage = "https://github.com/EricGrill/nostr-q"
+readme = "README.md"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -40,3 +44,35 @@ nostr-q-store = { path = "crates/nostr-q-store" }
 nostr-q-relay = { path = "crates/nostr-q-relay" }
 nostr-q = { path = "crates/nostr-q" }
 nostr-q-worker = { path = "crates/nostr-q-worker" }
+
+# Config for 'dist'
+[workspace.metadata.dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.32.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+installers = ["shell", "powershell", "homebrew"]
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = [
+    "aarch64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]
+packages = ["nostr-q-cli"]
+# A GitHub repo to push Homebrew formulas to
+tap = "EricGrill/homebrew-tap"
+# Publish jobs to run in CI
+publish-jobs = ["homebrew"]
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# Where to host releases
+hosting = "github"
+# Whether to install an updater program
+install-updater = false
+
+[profile.dist]
+inherits = "release"
+lto = "thin"

@@ -1,8 +1,24 @@
 [package]
-name = "nq"
+name = "nostr-q-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Command-line interface for Nostr-Q message queues and pub/sub over Nostr relays"
+categories = ["command-line-utilities"]
+keywords = ["nostr", "queue", "pubsub", "cli"]
+
+[[bin]]
+name = "nostr-q"
+path = "src/main.rs"
+
+[package.metadata.dist]
+dist = true
+formula = "nostr-q"
+display-name = "Nostr-Q"
 
 [dependencies]
 anyhow.workspace = true

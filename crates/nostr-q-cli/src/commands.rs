@@ -52,7 +52,7 @@ pub fn init(config_path: Option<PathBuf>) -> Result<()> {
     Store::open(&cfg.state_path())?; // create state db + schema now
     println!("initialized config at {}", path.display());
     println!("state db at {}", cfg.state_path().display());
-    println!("next: nq key generate && nq relay add <wss://url>");
+    println!("next: nostr-q key generate && nostr-q relay add <wss://url>");
     Ok(())
 }
 
@@ -102,7 +102,7 @@ pub fn relay_list(ctx: &Ctx) -> Result<()> {
     if ctx.json {
         println!("{}", serde_json::to_string(&relays)?);
     } else if relays.is_empty() {
-        println!("no relays configured — add one with `nq relay add <url>`");
+        println!("no relays configured - add one with `nostr-q relay add <url>`");
     } else {
         for url in relays {
             println!("{url}");
@@ -174,7 +174,7 @@ pub fn queue_list(ctx: &Ctx) -> Result<()> {
     if ctx.json {
         println!("{}", serde_json::to_string(&queues)?);
     } else if queues.is_empty() {
-        println!("no queues — create one with `nq queue create <name> --mode work_queue`");
+        println!("no queues - create one with `nostr-q queue create <name> --mode work_queue`");
     } else {
         for q in queues {
             println!(

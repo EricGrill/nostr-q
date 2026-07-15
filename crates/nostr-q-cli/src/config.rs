@@ -24,7 +24,7 @@ pub fn expand_tilde(s: &str) -> PathBuf {
 }
 
 pub fn default_config_path() -> PathBuf {
-    if let Ok(p) = std::env::var("NQ_CONFIG") {
+    if let Ok(p) = std::env::var("NOSTR_Q_CONFIG").or_else(|_| std::env::var("NQ_CONFIG")) {
         return PathBuf::from(p);
     }
     let local = PathBuf::from("nostr-q.toml");
@@ -45,8 +45,12 @@ impl Config {
     }
 
     pub fn load(path: &Path) -> Result<Self> {
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("reading config {} — run `nq init` first", path.display()))?;
+        let raw = std::fs::read_to_string(path).with_context(|| {
+            format!(
+                "reading config {} - run `nostr-q init` first",
+                path.display()
+            )
+        })?;
         Ok(toml::from_str(&raw)?)
     }
 
@@ -59,7 +63,7 @@ impl Config {
     }
 
     pub fn state_path(&self) -> PathBuf {
-        if let Ok(p) = std::env::var("NQ_STATE") {
+        if let Ok(p) = std::env::var("NOSTR_Q_STATE").or_else(|_| std::env::var("NQ_STATE")) {
             return expand_tilde(&p);
         }
         expand_tilde(&self.state)
@@ -71,13 +75,15 @@ impl Config {
 }
 
 pub fn load_keys(config: &Config) -> Result<nostr::Keys> {
-    if let Ok(sk) = std::env::var("NQ_PRIVATE_KEY") {
-        return nostr::Keys::parse(sk.trim()).context("parsing NQ_PRIVATE_KEY");
+    if let Ok(sk) =
+        std::env::var("NOSTR_Q_PRIVATE_KEY").or_else(|_| std::env::var("NQ_PRIVATE_KEY"))
+    {
+        return nostr::Keys::parse(sk.trim()).context("parsing NOSTR_Q_PRIVATE_KEY");
     }
     let path = config.key_path();
     let raw = std::fs::read_to_string(&path).with_context(|| {
         format!(
-            "reading key file {} — run `nq key generate` or set NQ_PRIVATE_KEY",
+            "reading key file {} - run `nostr-q key generate` or set NOSTR_Q_PRIVATE_KEY",
             path.display()
         )
     })?;
@@ -113,8 +119,7 @@ mod tests {
 
     #[test]
     fn default_config_path_is_xdg_style() {
-        // Only meaningful when NQ_CONFIG is unset and ./nostr-q.toml absent —
-        // both true in the test environment.
+        // Only meaningful when config env vars are unset and ./nostr-q.toml absent.
         let p = default_config_path();
         assert!(
             p.ends_with(".config/nostr-q/config.toml") || p == std::path::Path::new("nostr-q.toml"),

@@ -76,7 +76,7 @@ impl NostrQ {
         idem: Option<String>,
     ) -> Result<PublishReceipt> {
         let config = self.store.get_queue(queue)?.ok_or_else(|| {
-            anyhow!("unknown queue '{queue}' — create it with `nq queue create {queue}`")
+            anyhow!("unknown queue '{queue}' - create it with `nostr-q queue create {queue}`")
         })?;
         // Idempotent publish: a repeat (queue, idem) returns the original
         // receipt without re-broadcasting.
