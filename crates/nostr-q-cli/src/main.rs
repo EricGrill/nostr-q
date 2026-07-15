@@ -107,6 +107,17 @@ enum Cmd {
         #[arg(long)]
         with_relays: bool,
     },
+    /// Run an HTTP publish ingress (POST /pub/<queue>) so any language can
+    /// publish without linking the Rust SDK
+    Serve {
+        /// Address to bind the HTTP ingress to
+        #[arg(long, default_value = "127.0.0.1:8787")]
+        addr: String,
+        /// Bearer token required on /pub/* (also read from NQ_INGRESS_TOKEN).
+        /// Required unless --addr is loopback-only.
+        #[arg(long)]
+        token: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -266,6 +277,10 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Metrics { addr, with_relays } => {
             let ctx = Ctx::load(cli.config, cli.json)?;
             commands::metrics(&ctx, &addr, with_relays).await
+        }
+        Cmd::Serve { addr, token } => {
+            let ctx = Ctx::load(cli.config, cli.json)?;
+            commands::serve(&ctx, &addr, token).await
         }
     }
 }

@@ -1,9 +1,15 @@
 use std::io::Read;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use axum::extract::{Path as AxumPath, Query, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Json};
+use axum::routing::{get, post};
+use axum::Router;
 use nostr_q::queue::{Delivery, QueueConfig, QueueMode};
 use nostr_q::relay::{NostrTransport, RelayHealth, Transport};
 use nostr_q::store::{QueueStats, Store};
@@ -867,6 +873,206 @@ async fn handle_metrics_request(
     Ok(())
 }
 
+// --- `nostr-q serve` — HTTP publish ingress (CHA-2344) ---
+//
+// Lets any language publish to a queue over plain HTTP instead of linking
+// the Rust SDK. Because the endpoint signs with the node's private key and
+// broadcasts to the relay set, it must be access-controlled: see `serve`'s
+// bind-address / token checks below.
+
+/// Shared state handed to every ingress request handler.
+struct IngressState {
+    nq: Arc<NostrQ>,
+    token: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct PubQuery {
+    /// Delay delivery by this many seconds from now (maps to `not_before`).
+    delay: Option<i64>,
+    /// Expire (become unclaimable) this many seconds from now (maps to
+    /// `expires_at`).
+    ttl: Option<i64>,
+}
+
+fn error_body(msg: impl Into<String>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "error": msg.into() }))
+}
+
+fn bad_request(msg: impl Into<String>) -> Box<axum::response::Response> {
+    Box::new((StatusCode::BAD_REQUEST, error_body(msg)).into_response())
+}
+
+/// Turn the raw `delay`/`ttl` query params (seconds, relative to `now`) into
+/// absolute `not_before`/`expires_at` unix timestamps, rejecting negative
+/// values and any addition that would overflow `i64` — both indicate
+/// user-controlled garbage input rather than a legitimate request, and must
+/// yield `400 Bad Request` rather than a panic (debug builds) or a wrapped,
+/// nonsensical timestamp (release builds).
+///
+/// The error is boxed because `axum::response::Response` is large enough
+/// that clippy's `result_large_err` flags an unboxed `Result` here.
+fn resolve_publish_opts(
+    now: i64,
+    delay: Option<i64>,
+    ttl: Option<i64>,
+) -> Result<nostr_q::PublishOptions, Box<axum::response::Response>> {
+    let not_before = match delay {
+        Some(d) if d < 0 => {
+            return Err(bad_request(
+                "delay must be a non-negative number of seconds",
+            ))
+        }
+        Some(d) => Some(
+            now.checked_add(d)
+                .ok_or_else(|| bad_request("delay too large"))?,
+        ),
+        None => None,
+    };
+    let expires_at = match ttl {
+        Some(t) if t < 0 => {
+            return Err(bad_request("ttl must be a non-negative number of seconds"))
+        }
+        Some(t) => Some(
+            now.checked_add(t)
+                .ok_or_else(|| bad_request("ttl too large"))?,
+        ),
+        None => None,
+    };
+    Ok(nostr_q::PublishOptions {
+        not_before,
+        expires_at,
+    })
+}
+
+/// `true` iff `headers` carries `Authorization: Bearer <state.token>`, or no
+/// token is configured at all (open ingress — only ever allowed on a
+/// loopback bind, enforced in `serve`).
+fn authorized(state: &IngressState, headers: &HeaderMap) -> bool {
+    let Some(expected) = &state.token else {
+        return true;
+    };
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .is_some_and(|got| got == expected)
+}
+
+async fn healthz_handler() -> impl IntoResponse {
+    Json(serde_json::json!({ "ok": true }))
+}
+
+async fn pub_handler(
+    State(state): State<Arc<IngressState>>,
+    AxumPath(queue): AxumPath<String>,
+    Query(q): Query<PubQuery>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    if !authorized(&state, &headers) {
+        return (StatusCode::UNAUTHORIZED, error_body("unauthorized")).into_response();
+    }
+
+    let payload: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                error_body(format!("malformed JSON body: {e}")),
+            )
+                .into_response()
+        }
+    };
+
+    match state.nq.store().get_queue(&queue) {
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                error_body(format!("unknown queue '{queue}'")),
+            )
+                .into_response()
+        }
+        Ok(Some(_)) => {}
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error_body(e.to_string())).into_response()
+        }
+    }
+
+    let idem = headers
+        .get("Idempotency-Key")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let now = chrono::Utc::now().timestamp();
+    let opts = match resolve_publish_opts(now, q.delay, q.ttl) {
+        Ok(opts) => opts,
+        Err(resp) => return *resp,
+    };
+
+    match state.nq.publish_opts(&queue, payload, idem, opts).await {
+        Ok(receipt) => (StatusCode::OK, Json(receipt)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, error_body(e.to_string())).into_response(),
+    }
+}
+
+/// Maximum accepted `/pub/*` body size — protects the ingress (and the
+/// signing key it holds) from unbounded-memory-growth requests.
+const INGRESS_MAX_BODY_BYTES: usize = 1024 * 1024; // 1 MiB
+
+/// Build the ingress `Router`. Split out from `serve` so tests can drive it
+/// with a `MockTransport`-backed `NostrQ` via `tower::ServiceExt::oneshot`,
+/// with no real relay or network involved.
+pub fn build_ingress_router(nq: Arc<NostrQ>, token: Option<String>) -> Router {
+    let state = Arc::new(IngressState { nq, token });
+    Router::new()
+        .route("/healthz", get(healthz_handler))
+        .route("/pub/{queue}", post(pub_handler))
+        .with_state(state)
+        .layer(axum::extract::DefaultBodyLimit::max(INGRESS_MAX_BODY_BYTES))
+}
+
+/// Run the `nostr-q serve` HTTP ingress until ctrl-c.
+///
+/// Access control: when `token` (from `--token` or `NQ_INGRESS_TOKEN`) is
+/// set, every `/pub/*` request must carry a matching `Authorization: Bearer
+/// <token>` header. When no token is configured, the ingress refuses to
+/// start on any non-loopback address — an unauthenticated endpoint that
+/// signs and broadcasts with the node's private key must never be exposed
+/// off localhost. A loopback bind with no token is allowed for local dev,
+/// with a logged warning.
+pub async fn serve(ctx: &Ctx, addr: &str, token: Option<String>) -> Result<()> {
+    let token = token.or_else(|| std::env::var("NQ_INGRESS_TOKEN").ok());
+    let socket_addr: SocketAddr = addr
+        .parse()
+        .with_context(|| format!("invalid --addr '{addr}' — expected host:port"))?;
+
+    if token.is_none() {
+        anyhow::ensure!(
+            socket_addr.ip().is_loopback(),
+            "refusing to start nostr-q serve on non-loopback address {addr} without a \
+             --token/NQ_INGRESS_TOKEN — this endpoint signs and publishes with the node's \
+             private key and must not be exposed unauthenticated"
+        );
+        tracing::warn!(
+            "nostr-q serve: no --token/NQ_INGRESS_TOKEN configured — ingress is unauthenticated \
+             (allowed only because {addr} is loopback-only)"
+        );
+    }
+
+    let nq = Arc::new(ctx.connect().await?);
+    let router = build_ingress_router(nq, token);
+    let listener = TcpListener::bind(socket_addr)
+        .await
+        .with_context(|| format!("failed to bind {addr}"))?;
+    eprintln!("serving HTTP publish ingress on http://{addr} — ctrl-c to stop");
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1360,5 +1566,338 @@ mod tests {
             .await
             .expect("server task must join promptly after shutdown")
             .unwrap();
+    }
+
+    // --- `nostr-q serve` — HTTP publish ingress (CHA-2344) ---
+
+    fn test_nq() -> (Arc<NostrQ>, Arc<nostr_q::relay::MockTransport>) {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        store
+            .upsert_queue(&QueueConfig::work_queue("jobs.email"))
+            .unwrap();
+        let transport = Arc::new(nostr_q::relay::MockTransport::new());
+        let nq = Arc::new(NostrQ::new(
+            nostr::Keys::generate(),
+            store,
+            transport.clone(),
+        ));
+        (nq, transport)
+    }
+
+    async fn published_message_events(
+        transport: &nostr_q::relay::MockTransport,
+    ) -> Vec<nostr::Event> {
+        transport
+            .query(nostr::Filter::new().kind(nostr::Kind::Custom(nostr_q::protocol::KIND_MESSAGE)))
+            .await
+            .unwrap()
+    }
+
+    fn ingress_request(
+        method: &str,
+        uri: &str,
+        token: Option<&str>,
+        idem: Option<&str>,
+        body: &str,
+    ) -> axum::http::Request<axum::body::Body> {
+        let mut builder = axum::http::Request::builder().method(method).uri(uri);
+        if let Some(t) = token {
+            builder = builder.header("Authorization", format!("Bearer {t}"));
+        }
+        if let Some(k) = idem {
+            builder = builder.header("Idempotency-Key", k);
+        }
+        builder
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn ingress_publish_with_valid_token_returns_receipt_and_publishes_event() {
+        use tower::ServiceExt;
+
+        let (nq, transport) = test_nq();
+        let router = build_ingress_router(nq, Some("secret".into()));
+        let req = ingress_request(
+            "POST",
+            "/pub/jobs.email",
+            Some("secret"),
+            None,
+            r#"{"hi":1}"#,
+        );
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.get("mid").is_some(), "{json}");
+        assert!(json.get("trace_id").is_some(), "{json}");
+        assert!(json.get("event_id").is_some(), "{json}");
+
+        assert_eq!(published_message_events(&transport).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ingress_missing_or_wrong_token_is_rejected_and_publishes_nothing() {
+        use tower::ServiceExt;
+
+        let (nq, transport) = test_nq();
+
+        // missing header
+        let router = build_ingress_router(nq.clone(), Some("secret".into()));
+        let req = ingress_request("POST", "/pub/jobs.email", None, None, r#"{"hi":1}"#);
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // wrong token
+        let router = build_ingress_router(nq, Some("secret".into()));
+        let req = ingress_request("POST", "/pub/jobs.email", Some("nope"), None, r#"{"hi":1}"#);
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        assert_eq!(
+            published_message_events(&transport).await.len(),
+            0,
+            "unauthorized requests must not publish"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingress_unknown_queue_is_404() {
+        use tower::ServiceExt;
+
+        let (nq, _transport) = test_nq();
+        let router = build_ingress_router(nq, None);
+        let req = ingress_request("POST", "/pub/nope", None, None, r#"{"hi":1}"#);
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn ingress_malformed_json_is_400() {
+        use tower::ServiceExt;
+
+        let (nq, _transport) = test_nq();
+        let router = build_ingress_router(nq, None);
+        let req = ingress_request("POST", "/pub/jobs.email", None, None, "not json");
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn ingress_idempotency_key_dedupes() {
+        use tower::ServiceExt;
+
+        let (nq, transport) = test_nq();
+        let router = build_ingress_router(nq, None);
+
+        let req1 = ingress_request(
+            "POST",
+            "/pub/jobs.email",
+            None,
+            Some("order-1"),
+            r#"{"n":1}"#,
+        );
+        let resp1 = router.clone().oneshot(req1).await.unwrap();
+        assert_eq!(resp1.status(), StatusCode::OK);
+        let body1 = axum::body::to_bytes(resp1.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json1: serde_json::Value = serde_json::from_slice(&body1).unwrap();
+
+        let req2 = ingress_request(
+            "POST",
+            "/pub/jobs.email",
+            None,
+            Some("order-1"),
+            r#"{"n":2}"#,
+        );
+        let resp2 = router.clone().oneshot(req2).await.unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
+        let body2 = axum::body::to_bytes(resp2.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json2: serde_json::Value = serde_json::from_slice(&body2).unwrap();
+
+        assert_eq!(json1["mid"], json2["mid"], "same idem key must dedupe");
+        assert_eq!(
+            published_message_events(&transport).await.len(),
+            1,
+            "duplicate idem must not re-broadcast"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingress_healthz_returns_ok() {
+        use tower::ServiceExt;
+
+        let (nq, _transport) = test_nq();
+        let router = build_ingress_router(nq, Some("secret".into()));
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/healthz")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+    }
+
+    // --- delay/ttl overflow & negative-value validation (review fix,
+    // CHA-2344 round 1) ---
+    //
+    // `not_before`/`expires_at` are computed as `now + delay` /
+    // `now + ttl` from user-controlled query params. Before this fix that
+    // was unchecked `i64` addition: `?delay=<i64::MAX>` panicked the
+    // request task with "attempt to add with overflow" in debug builds and
+    // silently wrapped to a bogus timestamp in release builds. These tests
+    // prove the ingress now returns 400 instead, for both overflow and
+    // negative input, without ever calling into the transport.
+
+    #[tokio::test]
+    async fn ingress_rejects_overflowing_delay() {
+        use tower::ServiceExt;
+
+        let (nq, transport) = test_nq();
+        let router = build_ingress_router(nq, Some("secret".into()));
+        let req = ingress_request(
+            "POST",
+            "/pub/jobs.email?delay=9223372036854775807",
+            Some("secret"),
+            None,
+            r#"{"hi":1}"#,
+        );
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "an overflowing delay must be rejected with 400, not panic or wrap"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.get("error").is_some(), "{json}");
+
+        assert_eq!(
+            published_message_events(&transport).await.len(),
+            0,
+            "a rejected request must not publish anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingress_rejects_overflowing_ttl() {
+        use tower::ServiceExt;
+
+        let (nq, transport) = test_nq();
+        let router = build_ingress_router(nq, Some("secret".into()));
+        let req = ingress_request(
+            "POST",
+            "/pub/jobs.email?ttl=9223372036854775807",
+            Some("secret"),
+            None,
+            r#"{"hi":1}"#,
+        );
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "an overflowing ttl must be rejected with 400, not panic or wrap"
+        );
+
+        assert_eq!(
+            published_message_events(&transport).await.len(),
+            0,
+            "a rejected request must not publish anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingress_rejects_negative_delay() {
+        use tower::ServiceExt;
+
+        let (nq, transport) = test_nq();
+        let router = build_ingress_router(nq, Some("secret".into()));
+        let req = ingress_request(
+            "POST",
+            "/pub/jobs.email?delay=-5",
+            Some("secret"),
+            None,
+            r#"{"hi":1}"#,
+        );
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "a negative delay must be rejected with 400"
+        );
+
+        assert_eq!(
+            published_message_events(&transport).await.len(),
+            0,
+            "a rejected request must not publish anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingress_rejects_negative_ttl() {
+        use tower::ServiceExt;
+
+        let (nq, transport) = test_nq();
+        let router = build_ingress_router(nq, Some("secret".into()));
+        let req = ingress_request(
+            "POST",
+            "/pub/jobs.email?ttl=-5",
+            Some("secret"),
+            None,
+            r#"{"hi":1}"#,
+        );
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "a negative ttl must be rejected with 400"
+        );
+
+        assert_eq!(
+            published_message_events(&transport).await.len(),
+            0,
+            "a rejected request must not publish anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingress_valid_delay_still_publishes() {
+        use tower::ServiceExt;
+
+        let (nq, transport) = test_nq();
+        let router = build_ingress_router(nq, Some("secret".into()));
+        let req = ingress_request(
+            "POST",
+            "/pub/jobs.email?delay=30",
+            Some("secret"),
+            None,
+            r#"{"hi":1}"#,
+        );
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a reasonable delay must not be over-rejected"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.get("mid").is_some(), "{json}");
+
+        assert_eq!(published_message_events(&transport).await.len(), 1);
     }
 }
