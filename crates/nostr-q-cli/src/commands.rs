@@ -899,6 +899,52 @@ fn error_body(msg: impl Into<String>) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "error": msg.into() }))
 }
 
+fn bad_request(msg: impl Into<String>) -> Box<axum::response::Response> {
+    Box::new((StatusCode::BAD_REQUEST, error_body(msg)).into_response())
+}
+
+/// Turn the raw `delay`/`ttl` query params (seconds, relative to `now`) into
+/// absolute `not_before`/`expires_at` unix timestamps, rejecting negative
+/// values and any addition that would overflow `i64` — both indicate
+/// user-controlled garbage input rather than a legitimate request, and must
+/// yield `400 Bad Request` rather than a panic (debug builds) or a wrapped,
+/// nonsensical timestamp (release builds).
+///
+/// The error is boxed because `axum::response::Response` is large enough
+/// that clippy's `result_large_err` flags an unboxed `Result` here.
+fn resolve_publish_opts(
+    now: i64,
+    delay: Option<i64>,
+    ttl: Option<i64>,
+) -> Result<nostr_q::PublishOptions, Box<axum::response::Response>> {
+    let not_before = match delay {
+        Some(d) if d < 0 => {
+            return Err(bad_request(
+                "delay must be a non-negative number of seconds",
+            ))
+        }
+        Some(d) => Some(
+            now.checked_add(d)
+                .ok_or_else(|| bad_request("delay too large"))?,
+        ),
+        None => None,
+    };
+    let expires_at = match ttl {
+        Some(t) if t < 0 => {
+            return Err(bad_request("ttl must be a non-negative number of seconds"))
+        }
+        Some(t) => Some(
+            now.checked_add(t)
+                .ok_or_else(|| bad_request("ttl too large"))?,
+        ),
+        None => None,
+    };
+    Ok(nostr_q::PublishOptions {
+        not_before,
+        expires_at,
+    })
+}
+
 /// `true` iff `headers` carries `Authorization: Bearer <state.token>`, or no
 /// token is configured at all (open ingress — only ever allowed on a
 /// loopback bind, enforced in `serve`).
@@ -958,9 +1004,9 @@ async fn pub_handler(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
     let now = chrono::Utc::now().timestamp();
-    let opts = nostr_q::PublishOptions {
-        not_before: q.delay.map(|d| now + d),
-        expires_at: q.ttl.map(|t| now + t),
+    let opts = match resolve_publish_opts(now, q.delay, q.ttl) {
+        Ok(opts) => opts,
+        Err(resp) => return *resp,
     };
 
     match state.nq.publish_opts(&queue, payload, idem, opts).await {
@@ -1701,5 +1747,157 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["ok"], true);
+    }
+
+    // --- delay/ttl overflow & negative-value validation (review fix,
+    // CHA-2344 round 1) ---
+    //
+    // `not_before`/`expires_at` are computed as `now + delay` /
+    // `now + ttl` from user-controlled query params. Before this fix that
+    // was unchecked `i64` addition: `?delay=<i64::MAX>` panicked the
+    // request task with "attempt to add with overflow" in debug builds and
+    // silently wrapped to a bogus timestamp in release builds. These tests
+    // prove the ingress now returns 400 instead, for both overflow and
+    // negative input, without ever calling into the transport.
+
+    #[tokio::test]
+    async fn ingress_rejects_overflowing_delay() {
+        use tower::ServiceExt;
+
+        let (nq, transport) = test_nq();
+        let router = build_ingress_router(nq, Some("secret".into()));
+        let req = ingress_request(
+            "POST",
+            "/pub/jobs.email?delay=9223372036854775807",
+            Some("secret"),
+            None,
+            r#"{"hi":1}"#,
+        );
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "an overflowing delay must be rejected with 400, not panic or wrap"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.get("error").is_some(), "{json}");
+
+        assert_eq!(
+            published_message_events(&transport).await.len(),
+            0,
+            "a rejected request must not publish anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingress_rejects_overflowing_ttl() {
+        use tower::ServiceExt;
+
+        let (nq, transport) = test_nq();
+        let router = build_ingress_router(nq, Some("secret".into()));
+        let req = ingress_request(
+            "POST",
+            "/pub/jobs.email?ttl=9223372036854775807",
+            Some("secret"),
+            None,
+            r#"{"hi":1}"#,
+        );
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "an overflowing ttl must be rejected with 400, not panic or wrap"
+        );
+
+        assert_eq!(
+            published_message_events(&transport).await.len(),
+            0,
+            "a rejected request must not publish anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingress_rejects_negative_delay() {
+        use tower::ServiceExt;
+
+        let (nq, transport) = test_nq();
+        let router = build_ingress_router(nq, Some("secret".into()));
+        let req = ingress_request(
+            "POST",
+            "/pub/jobs.email?delay=-5",
+            Some("secret"),
+            None,
+            r#"{"hi":1}"#,
+        );
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "a negative delay must be rejected with 400"
+        );
+
+        assert_eq!(
+            published_message_events(&transport).await.len(),
+            0,
+            "a rejected request must not publish anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingress_rejects_negative_ttl() {
+        use tower::ServiceExt;
+
+        let (nq, transport) = test_nq();
+        let router = build_ingress_router(nq, Some("secret".into()));
+        let req = ingress_request(
+            "POST",
+            "/pub/jobs.email?ttl=-5",
+            Some("secret"),
+            None,
+            r#"{"hi":1}"#,
+        );
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "a negative ttl must be rejected with 400"
+        );
+
+        assert_eq!(
+            published_message_events(&transport).await.len(),
+            0,
+            "a rejected request must not publish anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingress_valid_delay_still_publishes() {
+        use tower::ServiceExt;
+
+        let (nq, transport) = test_nq();
+        let router = build_ingress_router(nq, Some("secret".into()));
+        let req = ingress_request(
+            "POST",
+            "/pub/jobs.email?delay=30",
+            Some("secret"),
+            None,
+            r#"{"hi":1}"#,
+        );
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a reasonable delay must not be over-rejected"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.get("mid").is_some(), "{json}");
+
+        assert_eq!(published_message_events(&transport).await.len(), 1);
     }
 }

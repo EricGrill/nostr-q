@@ -1411,7 +1411,6 @@ dependencies = [
  "nostr",
  "nostr-q",
  "nostr-q-worker",
- "reqwest",
  "serde",
  "serde_json",
  "tempfile",
