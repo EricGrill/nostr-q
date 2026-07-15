@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use nostr::EventId;
 use nostr_q::envelope::Envelope;
 use nostr_q::store::MessageRecord;
 use nostr_q::{NackOutcome, NostrQ};
@@ -28,6 +29,11 @@ pub struct JobContext {
     pub generation: u32,
     pub idem: Option<String>,
     pub payload: serde_json::Value,
+    /// Hex-encoded id of the original `KIND_MESSAGE` event for this job.
+    /// Needed to correlate a `KIND_REPLY` back to the request (the reply
+    /// event's `e` tag) when the handler returns `Success { reply: Some }`
+    /// for an RPC request.
+    pub event_id: String,
 }
 
 impl JobContext {
@@ -43,13 +49,20 @@ impl JobContext {
             generation: rec.attempts,
             idem: rec.idem_key.clone(),
             payload,
+            event_id: rec.event_id.clone(),
         }
     }
 }
 
 #[derive(Debug)]
 pub enum HandlerOutcome {
-    Success,
+    /// `reply` carries the RPC reply body for a request that set a `reply`
+    /// tag (see `NqMessage::reply_to`). `None` for ordinary jobs, or for an
+    /// RPC job whose handler produced no reply body — `run_worker` only
+    /// publishes a reply when this is `Some`.
+    Success {
+        reply: Option<serde_json::Value>,
+    },
     Failure(String),
 }
 
@@ -65,6 +78,42 @@ pub struct WorkerOptions {
     pub heartbeat_seconds: u64,
     pub settle_ms: u64,
     pub poll_ms: u64,
+}
+
+/// After a successful handler run that produced a reply body, publish a
+/// `KIND_REPLY` correlated to the request — but only if the request was
+/// actually an RPC request (carried a `reply` tag). `MessageRecord` doesn't
+/// persist `reply_to` itself, so this looks it up via `request_reply_to`,
+/// which re-fetches the original request event by id. Failures here (bad
+/// event id, no responder pubkey, transport error) are logged and
+/// swallowed — the job WAS processed correctly, so the caller must still
+/// ack it even if the reply couldn't be delivered.
+async fn publish_rpc_reply_if_requested(nq: &NostrQ, job: &JobContext, body: serde_json::Value) {
+    let request_event_id = match EventId::from_hex(&job.event_id) {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(mid = %job.mid, error = %e, "bad event id on job; cannot publish reply");
+            return;
+        }
+    };
+    match nq.request_reply_to(request_event_id).await {
+        Ok(Some(requester)) => {
+            if let Err(e) = nq
+                .publish_reply(&requester, request_event_id, &job.mid, body)
+                .await
+            {
+                tracing::warn!(mid = %job.mid, error = %e, "failed to publish rpc reply");
+            }
+        }
+        Ok(None) => {
+            // Not an RPC request (no `reply` tag) — the handler returned a
+            // reply body anyway, which is fine; there's just nowhere to
+            // send it.
+        }
+        Err(e) => {
+            tracing::warn!(mid = %job.mid, error = %e, "failed to look up rpc requester");
+        }
+    }
 }
 
 pub async fn run_worker(
@@ -198,7 +247,12 @@ pub async fn run_worker(
                             )),
                         };
                         let settled = match outcome {
-                            HandlerOutcome::Success => nq.ack(&rec.mid).await,
+                            HandlerOutcome::Success { reply } => {
+                                if let Some(body) = reply {
+                                    publish_rpc_reply_if_requested(&nq, &job, body).await;
+                                }
+                                nq.ack(&rec.mid).await
+                            }
                             HandlerOutcome::Failure(reason) => {
                                 tracing::warn!(mid = %rec.mid, reason = %reason, "handler failed");
                                 nq.nack(&rec.mid, &reason)
@@ -276,6 +330,7 @@ mod tests {
             generation: 0,
             idem: Some("i1".into()),
             payload: json!({"n": 1}),
+            event_id: "e1".into(),
         }
     }
 
@@ -285,7 +340,34 @@ mod tests {
             // proves stdin + env are wired: fails unless payload and NQ_MID arrive
             command: r#"payload=$(cat); test "$payload" = '{"n":1}' && test "$NQ_MID" = m1"#.into(),
         };
-        assert!(matches!(h.handle(&job()).await, HandlerOutcome::Success));
+        assert!(matches!(
+            h.handle(&job()).await,
+            HandlerOutcome::Success { reply: None }
+        ));
+    }
+
+    #[tokio::test]
+    async fn exec_handler_captures_json_stdout_as_reply() {
+        let h = crate::handlers::ExecHandler {
+            command: r#"echo '{"result": 42}'"#.into(),
+        };
+        match h.handle(&job()).await {
+            HandlerOutcome::Success { reply } => {
+                assert_eq!(reply, Some(json!({"result": 42})))
+            }
+            HandlerOutcome::Failure(reason) => panic!("expected success: {reason}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn exec_handler_non_json_stdout_yields_no_reply() {
+        let h = crate::handlers::ExecHandler {
+            command: "echo not json at all".into(),
+        };
+        match h.handle(&job()).await {
+            HandlerOutcome::Success { reply } => assert_eq!(reply, None),
+            HandlerOutcome::Failure(reason) => panic!("expected success: {reason}"),
+        }
     }
 
     #[tokio::test]
@@ -304,7 +386,7 @@ mod tests {
                     "reason should include stderr: {reason}"
                 );
             }
-            HandlerOutcome::Success => panic!("expected failure"),
+            HandlerOutcome::Success { .. } => panic!("expected failure"),
         }
     }
 
@@ -458,12 +540,15 @@ mod tests {
             .await;
 
         let ok = crate::handlers::HttpHandler::new(format!("{}/jobs/ok", server.uri()));
-        assert!(matches!(ok.handle(&job()).await, HandlerOutcome::Success));
+        assert!(matches!(
+            ok.handle(&job()).await,
+            HandlerOutcome::Success { .. }
+        ));
 
         let fail = crate::handlers::HttpHandler::new(format!("{}/jobs/fail", server.uri()));
         match fail.handle(&job()).await {
             HandlerOutcome::Failure(reason) => assert!(reason.contains("500"), "{reason}"),
-            HandlerOutcome::Success => panic!("expected failure"),
+            HandlerOutcome::Success { .. } => panic!("expected failure"),
         }
     }
 
@@ -495,7 +580,7 @@ mod tests {
         );
         match outcome {
             HandlerOutcome::Failure(reason) => assert!(!reason.is_empty()),
-            HandlerOutcome::Success => panic!("expected the request to time out"),
+            HandlerOutcome::Success { .. } => panic!("expected the request to time out"),
         }
     }
 
@@ -507,7 +592,7 @@ mod tests {
     impl Handler for CapturingHandler {
         async fn handle(&self, job: &JobContext) -> HandlerOutcome {
             *self.captured.lock().unwrap() = Some((job.attempt, job.generation));
-            HandlerOutcome::Success
+            HandlerOutcome::Success { reply: None }
         }
     }
 
@@ -656,7 +741,7 @@ mod tests {
         async fn handle(&self, _job: &JobContext) -> HandlerOutcome {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            HandlerOutcome::Success
+            HandlerOutcome::Success { reply: None }
         }
     }
 
@@ -709,6 +794,127 @@ mod tests {
             calls.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "a job must execute exactly once per process even at concurrency > 1"
+        );
+    }
+
+    // --- request/reply RPC (CHA-2347) ---
+
+    /// Headline end-to-end RPC test: two independent `NostrQ` nodes share a
+    /// `MockTransport`. One drives `run_worker` with an `ExecHandler` that
+    /// echoes its stdin (the job payload) back to stdout as JSON; the other
+    /// calls `NostrQ::call`, which must unblock with exactly that echoed
+    /// body once the worker claims, runs, and replies to the request.
+    #[tokio::test]
+    async fn rpc_request_reply_end_to_end_via_worker() {
+        let transport = Arc::new(MockTransport::new());
+        let mk = |t: Arc<MockTransport>| {
+            let store = Arc::new(Store::open_in_memory().unwrap());
+            store
+                .upsert_queue(&QueueConfig::work_queue("rpc.echo"))
+                .unwrap();
+            Arc::new(NostrQ::new(Keys::generate(), store, t))
+        };
+        let caller = mk(transport.clone());
+        let worker_nq = mk(transport.clone());
+
+        let shutdown = CancellationToken::new();
+        let opts = WorkerOptions {
+            concurrency: 2,
+            lease_seconds: 60,
+            heartbeat_seconds: 3600,
+            settle_ms: 10,
+            poll_ms: 50,
+        };
+        let handle = tokio::spawn(run_worker(
+            worker_nq.clone(),
+            "rpc.echo".into(),
+            Arc::new(crate::handlers::ExecHandler {
+                // echo stdin (the job payload) straight back out as the reply
+                command: "cat".into(),
+            }),
+            opts,
+            shutdown.clone(),
+        ));
+
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            caller.call(
+                "rpc.echo",
+                json!({"n": 7}),
+                std::time::Duration::from_secs(5),
+            ),
+        )
+        .await
+        .expect("call should not hang")
+        .expect("call should receive the worker's reply");
+
+        shutdown.cancel();
+        handle.await.unwrap().unwrap();
+
+        assert_eq!(
+            reply,
+            json!({"n": 7}),
+            "call() must return the handler's echoed JSON reply"
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_reply_publish_failure_still_acks_the_request() {
+        // A handler that returns a reply for a NON-rpc message (no
+        // reply_to) must still be acked normally — publish_rpc_reply's
+        // "not an RPC request" branch must not block settlement.
+        let nq = make_nq();
+        let receipt = nq
+            .publish("jobs.email", json!({"n": 1}), None)
+            .await
+            .unwrap();
+
+        struct EchoingHandler;
+        #[async_trait::async_trait]
+        impl Handler for EchoingHandler {
+            async fn handle(&self, _job: &JobContext) -> HandlerOutcome {
+                HandlerOutcome::Success {
+                    reply: Some(json!({"ignored": true})),
+                }
+            }
+        }
+
+        let shutdown = CancellationToken::new();
+        let opts = WorkerOptions {
+            concurrency: 1,
+            lease_seconds: 60,
+            heartbeat_seconds: 3600,
+            settle_ms: 10,
+            poll_ms: 50,
+        };
+        let handle = tokio::spawn(run_worker(
+            nq.clone(),
+            "jobs.email".into(),
+            Arc::new(EchoingHandler),
+            opts,
+            shutdown.clone(),
+        ));
+
+        let mut acked = false;
+        for _ in 0..100 {
+            if nq
+                .store()
+                .get_message(&receipt.mid)
+                .unwrap()
+                .unwrap()
+                .status
+                == "acked"
+            {
+                acked = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        shutdown.cancel();
+        handle.await.unwrap().unwrap();
+        assert!(
+            acked,
+            "a reply body on a non-RPC message must not block the ack"
         );
     }
 }
