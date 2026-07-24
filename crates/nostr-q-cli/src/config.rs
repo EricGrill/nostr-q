@@ -9,14 +9,32 @@ pub struct Config {
     pub key_file: String,
 }
 
+/// Resolve the user's home directory, honoring an explicit `HOME` override on
+/// every platform.
+///
+/// `dirs::home_dir()` reads `$HOME` on Unix but ignores it on Windows, where it
+/// goes straight to the OS profile API (`SHGetKnownFolderPath`). That
+/// inconsistency meant a `HOME` set for test isolation — or by a user wanting a
+/// sandboxed run — was silently dropped on Windows, so `~`-based config/state/key
+/// paths escaped isolation and wrote into the real user profile (CHA-2529).
+/// Checking `HOME` ourselves first makes the override behave identically across
+/// platforms; we fall back to `dirs::home_dir()` (USERPROFILE on Windows,
+/// `$HOME` on Unix) only when it is unset.
+fn home_dir() -> Option<PathBuf> {
+    if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+        return Some(PathBuf::from(home));
+    }
+    dirs::home_dir()
+}
+
 pub fn expand_tilde(s: &str) -> PathBuf {
     if s == "~" {
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = home_dir() {
             return home;
         }
     }
     if let Some(rest) = s.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = home_dir() {
             return home.join(rest);
         }
     }
@@ -31,7 +49,7 @@ pub fn default_config_path() -> PathBuf {
     if local.exists() {
         return local;
     }
-    dirs::home_dir()
+    home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".config/nostr-q/config.toml")
 }
@@ -114,7 +132,19 @@ mod tests {
             expand_tilde("/abs/path"),
             std::path::PathBuf::from("/abs/path")
         );
-        assert_eq!(expand_tilde("~"), dirs::home_dir().unwrap());
+        assert_eq!(expand_tilde("~"), home_dir().unwrap());
+    }
+
+    #[test]
+    fn home_dir_prefers_home_env_when_set() {
+        // The fix for CHA-2529: an explicit `HOME` must win on every platform,
+        // not just Unix. We assert against the ambient `HOME` (set during
+        // `cargo test`) rather than mutating the process-global env, which would
+        // race the other tests in this module that read it.
+        if let Some(h) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+            assert_eq!(home_dir(), Some(PathBuf::from(h)));
+            assert_eq!(expand_tilde("~/q"), home_dir().unwrap().join("q"));
+        }
     }
 
     #[test]
