@@ -975,6 +975,29 @@ fn resolve_publish_opts(
     })
 }
 
+/// Compare two byte slices in time that does not depend on their contents.
+///
+/// Rust's `==` on `&str`/`&[u8]` short-circuits at the first differing byte, so
+/// the time it takes to reject a wrong bearer token leaks how many leading
+/// bytes were correct — letting a network attacker recover the token one byte
+/// at a time from response-latency samples (CHA-2538). This walks every byte of
+/// an equal-length input and folds all differences into one accumulator, so the
+/// comparison time is independent of *where* (or whether) the bytes differ.
+///
+/// The length check can still reveal the token's length via timing, but the
+/// token is high-entropy and its length is not what an attacker recovers
+/// incrementally; defeating the byte-by-byte content comparison is the point.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// `true` iff `headers` carries `Authorization: Bearer <state.token>`, or no
 /// token is configured at all (open ingress — only ever allowed on a
 /// loopback bind, enforced in `serve`).
@@ -986,7 +1009,7 @@ fn authorized(state: &IngressState, headers: &HeaderMap) -> bool {
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|got| got == expected)
+        .is_some_and(|got| constant_time_eq(got.as_bytes(), expected.as_bytes()))
 }
 
 async fn healthz_handler() -> impl IntoResponse {
@@ -1334,6 +1357,23 @@ pub async fn dev(addr: &str, dir: Option<PathBuf>, with_sample: bool) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- ingress bearer-token comparison (CHA-2538) ---
+
+    #[test]
+    fn constant_time_eq_matches_semantics_of_equality() {
+        // Same behavior as `==` — only the timing profile differs.
+        assert!(constant_time_eq(b"", b""));
+        assert!(constant_time_eq(b"s3cret-token", b"s3cret-token"));
+        // Differs in the last byte only (the case plain `==` rejects slowest).
+        assert!(!constant_time_eq(b"s3cret-token", b"s3cret-tokeN"));
+        // Differs in the first byte (the case plain `==` rejects fastest).
+        assert!(!constant_time_eq(b"s3cret-token", b"S3cret-token"));
+        // Length mismatch, including prefix relationships.
+        assert!(!constant_time_eq(b"s3cret-token", b"s3cret-toke"));
+        assert!(!constant_time_eq(b"s3cret", b"s3cret-token"));
+        assert!(!constant_time_eq(b"", b"x"));
+    }
 
     // --- `nostr-q dev` — zero-dependency quickstart (CHA-2343) ---
 
