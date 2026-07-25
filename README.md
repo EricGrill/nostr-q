@@ -267,7 +267,37 @@ export `nostrq_relay_up` (1/0) and `nostrq_relay_latency_ms` (0 when down or
 unknown) labeled `url="<relay-url>"`. This does a live network health check per
 scrape, so it's opt-in.
 
-Any path other than `GET /metrics` returns `404`.
+### Health endpoints
+
+The same server exposes two probe endpoints for orchestrators:
+
+| Endpoint | Meaning | Codes |
+|---|---|---|
+| `GET /healthz` | **Liveness.** The process is up and still accepting connections. | always `200` |
+| `GET /readyz` | **Readiness.** The store answers queries, and — with `--with-relays` — at least one relay is reachable. | `200` / `503` |
+
+`/healthz` deliberately does not touch the store or relays: a liveness probe that
+fails during a dependency outage gets a healthy process restarted for no reason.
+Use `/readyz` to drain traffic instead.
+
+`/readyz` reports *which* dependency is unhappy, so a failing probe is
+actionable without digging through logs:
+
+```console
+$ curl -s localhost:9090/readyz          # healthy
+ready
+store=ok
+relays=not_checked
+
+$ curl -si localhost:9090/readyz | head -1   # relay set unreachable
+HTTP/1.1 503 Service Unavailable
+not ready
+store=ok
+relays=unreachable
+detail=no configured relay answered
+```
+
+Any path other than `GET /metrics`, `GET /healthz` or `GET /readyz` returns `404`.
 
 ## HTTP Ingress
 
