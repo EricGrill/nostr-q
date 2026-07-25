@@ -768,6 +768,106 @@ async fn gather_metrics(ctx: &Ctx, with_relays: bool) -> Result<String> {
     Ok(render_prometheus(&queues, relays.as_deref()))
 }
 
+/// Outcome of a `/readyz` probe (CHA-2570).
+///
+/// Kept as data rather than a bare bool so the endpoint can say *why* it is
+/// not ready — "queue depth looks fine" and "this node cannot reach a relay"
+/// are very different operational states, and a bare 503 hides which one you
+/// are in.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Readiness {
+    pub ready: bool,
+    /// The store answered a query.
+    pub store_ok: bool,
+    /// `None` when relay probing is disabled, else whether ≥1 relay answered.
+    pub relays_ok: Option<bool>,
+    pub detail: Option<String>,
+}
+
+impl Readiness {
+    /// Plain-text body, one `key=value` per line so it is greppable from a
+    /// probe's failure output without needing a JSON parser.
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        out.push_str(if self.ready { "ready\n" } else { "not ready\n" });
+        out.push_str(&format!(
+            "store={}\n",
+            if self.store_ok { "ok" } else { "unreachable" }
+        ));
+        match self.relays_ok {
+            Some(true) => out.push_str("relays=ok\n"),
+            Some(false) => out.push_str("relays=unreachable\n"),
+            None => out.push_str("relays=not_checked\n"),
+        }
+        if let Some(detail) = &self.detail {
+            out.push_str(&format!("detail={detail}\n"));
+        }
+        out
+    }
+}
+
+/// Probe the dependencies `/readyz` reports on.
+///
+/// Never returns `Err`: a failed probe IS the answer, and propagating the
+/// error here would turn a readiness signal into a dropped connection.
+async fn gather_readiness(ctx: &Ctx, with_relays: bool) -> Readiness {
+    let now = chrono::Utc::now().timestamp();
+
+    // Touching every queue's stats exercises the same read path a scrape
+    // uses, so a corrupt/locked store shows up here rather than only at
+    // /metrics.
+    let store_result = ctx.store.list_queues().and_then(|queues| {
+        for q in &queues {
+            ctx.store.stats(&q.name, now)?;
+        }
+        Ok(())
+    });
+    let store_ok = store_result.is_ok();
+    let mut detail = store_result.err().map(|e| e.to_string());
+
+    if !with_relays {
+        return Readiness {
+            ready: store_ok,
+            store_ok,
+            relays_ok: None,
+            detail,
+        };
+    }
+
+    let relays_ok = match probe_relays(ctx).await {
+        Ok(any_up) => {
+            if !any_up && detail.is_none() {
+                detail = Some("no configured relay answered".to_string());
+            }
+            any_up
+        }
+        Err(e) => {
+            if detail.is_none() {
+                detail = Some(e.to_string());
+            }
+            false
+        }
+    };
+
+    Readiness {
+        ready: store_ok && relays_ok,
+        store_ok,
+        relays_ok: Some(relays_ok),
+        detail,
+    }
+}
+
+/// `true` when at least one configured relay answered a health probe.
+async fn probe_relays(ctx: &Ctx) -> Result<bool> {
+    let keys = config::load_keys(&ctx.config)?;
+    let relay_urls = ctx.store.list_relays()?;
+    if relay_urls.is_empty() {
+        return Ok(false);
+    }
+    let transport = NostrTransport::connect(keys, &relay_urls).await?;
+    Ok(transport.health().await.iter().any(|r| r.connected))
+}
+
 /// Serve `GET /metrics` in Prometheus text exposition format over a raw
 /// TCP accept loop — no web framework needed for a single read-only
 /// endpoint. Runs until ctrl-c.
@@ -886,6 +986,36 @@ async fn handle_metrics_request(
         let body = gather_metrics(ctx, with_relays).await?;
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        socket.write_all(response.as_bytes()).await?;
+    } else if method == "GET" && path == "/healthz" {
+        // Liveness only: reaching this handler proves the process is up and
+        // the accept loop is still serving. Deliberately does NOT touch the
+        // store or relays — a liveness probe that fails on a dependency
+        // outage causes orchestrators to restart a healthy process.
+        let body = "ok";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        socket.write_all(response.as_bytes()).await?;
+    } else if method == "GET" && path == "/readyz" {
+        // Readiness: can this node actually do its job right now? That means
+        // the store answers queries, and — when relay probing is enabled —
+        // at least one relay is reachable. 503 lets an orchestrator drain
+        // traffic without killing the process.
+        let report = gather_readiness(ctx, with_relays).await;
+        let (status_line, body) = if report.ready {
+            ("HTTP/1.1 200 OK", report.render())
+        } else {
+            ("HTTP/1.1 503 Service Unavailable", report.render())
+        };
+        let response = format!(
+            "{}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            status_line,
             body.len(),
             body
         );
@@ -1849,6 +1979,69 @@ mod tests {
         assert!(body.contains("nostrq_relay_latency_ms{url=\"wss://relay.down.example\"} 0\n"));
     }
 
+    // --- /readyz reporting (CHA-2570) ---
+
+    #[test]
+    fn readiness_reports_ready_when_store_ok_and_relays_unchecked() {
+        let r = Readiness {
+            ready: true,
+            store_ok: true,
+            relays_ok: None,
+            detail: None,
+        };
+        let body = r.render();
+        assert!(body.starts_with("ready\n"), "{body}");
+        assert!(body.contains("store=ok\n"), "{body}");
+        assert!(body.contains("relays=not_checked\n"), "{body}");
+    }
+
+    #[test]
+    fn readiness_says_which_dependency_failed() {
+        // A bare 503 hides whether the store or the relay set is the problem.
+        let r = Readiness {
+            ready: false,
+            store_ok: true,
+            relays_ok: Some(false),
+            detail: Some("no configured relay answered".into()),
+        };
+        let body = r.render();
+        assert!(body.starts_with("not ready\n"), "{body}");
+        assert!(body.contains("store=ok\n"), "{body}");
+        assert!(body.contains("relays=unreachable\n"), "{body}");
+        assert!(
+            body.contains("detail=no configured relay answered\n"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn readiness_reports_an_unreachable_store() {
+        let r = Readiness {
+            ready: false,
+            store_ok: false,
+            relays_ok: Some(true),
+            detail: Some("database is locked".into()),
+        };
+        let body = r.render();
+        assert!(body.contains("store=unreachable\n"), "{body}");
+        assert!(body.contains("detail=database is locked\n"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn gather_readiness_is_ready_with_a_reachable_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path().join("key"));
+        ctx.store
+            .upsert_queue(&QueueConfig::work_queue("jobs.email"))
+            .unwrap();
+
+        let report = gather_readiness(&ctx, false).await;
+
+        assert!(report.ready);
+        assert!(report.store_ok);
+        assert_eq!(report.relays_ok, None);
+    }
+
     #[test]
     fn render_prometheus_escapes_label_values() {
         let queues = vec![(
@@ -1905,6 +2098,20 @@ mod tests {
 
         let (head, _) = get(addr, "/other").await;
         assert!(head.starts_with("HTTP/1.1 404"), "{head}");
+
+        // CHA-2570: liveness is unconditional — it must not consult the store
+        // or relays, or a dependency outage would get a healthy process
+        // restarted.
+        let (head, body) = get(addr, "/healthz").await;
+        assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
+        assert_eq!(body, "ok");
+
+        // Readiness with relay probing off: a reachable store is enough.
+        let (head, body) = get(addr, "/readyz").await;
+        assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
+        assert!(body.starts_with("ready\n"), "{body}");
+        assert!(body.contains("store=ok\n"), "{body}");
+        assert!(body.contains("relays=not_checked\n"), "{body}");
 
         shutdown.cancel();
         // unblock the accept loop's select! so the spawned task can exit.
