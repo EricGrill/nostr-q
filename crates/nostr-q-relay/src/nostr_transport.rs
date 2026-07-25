@@ -129,3 +129,116 @@ impl Transport for NostrTransport {
         futures::future::join_all(probes).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dev_relay::serve_dev_relay;
+    use nostr::{EventBuilder, Kind};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Unique-content 4620 event so its content-addressed id never collides
+    /// with another built at the same call site within the same wall-clock
+    /// second (mirrors the helper in `dev_relay`'s own tests).
+    fn signed_event(keys: &Keys, topic: &str) -> Event {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        EventBuilder::new(Kind::Custom(4620), format!("body-{n}"))
+            .tags(vec![nostr::Tag::hashtag(topic)])
+            .sign_with_keys(keys)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn connect_rejects_empty_relay_list() {
+        // A transport with nowhere to publish is a configuration error, not a
+        // silently-inert client that would swallow every publish downstream.
+        // `NostrTransport` isn't `Debug`, so match rather than `expect_err`.
+        let err = match NostrTransport::connect(Keys::generate(), &[]).await {
+            Ok(_) => panic!("connecting with no relays must error"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("no relays configured"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_returns_events_stored_on_the_relay() {
+        // Exercises the real `query()` (REQ -> stored replay -> EOSE) path
+        // against the embedded relay, which the publish/subscribe interop
+        // tests never touch. A separate reader client avoids nostr-sdk's
+        // local-echo dedup.
+        let relay = serve_dev_relay("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("dev relay must start");
+        let url = relay.url();
+        let keys = Keys::generate();
+        let publisher = NostrTransport::connect(keys.clone(), std::slice::from_ref(&url))
+            .await
+            .unwrap();
+        let reader = NostrTransport::connect(Keys::generate(), &[url])
+            .await
+            .unwrap();
+
+        let event = signed_event(&keys, "query-me");
+        // publish() resolves only after the relay's OK, so the event is stored.
+        publisher.publish(event.clone()).await.unwrap();
+
+        let filter = Filter::new().kind(Kind::Custom(4620)).hashtag("query-me");
+        let found = reader.query(filter).await.expect("query must succeed");
+        assert!(
+            found.iter().any(|e| e.id == event.id),
+            "query must return the event stored on the relay"
+        );
+        relay.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn health_reports_connected_with_latency_for_a_live_relay() {
+        let relay = serve_dev_relay("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("dev relay must start");
+        let url = relay.url();
+        let transport = NostrTransport::connect(Keys::generate(), &[url])
+            .await
+            .unwrap();
+
+        let health = transport.health().await;
+        assert_eq!(health.len(), 1, "one configured relay => one health entry");
+        assert!(health[0].connected, "a live relay must report connected");
+        assert!(
+            health[0].latency_ms.is_some(),
+            "a connected relay must report a latency probe"
+        );
+        relay.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn health_reports_disconnected_for_an_unreachable_relay() {
+        // Start then stop a relay so its port is no longer accepting, giving
+        // us a well-formed but dead ws:// URL. `connect()` still returns Ok
+        // (nostr-sdk connects in the background), and `health()` must ride out
+        // its handshake window and then report the relay down with no latency.
+        let relay = serve_dev_relay("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("dev relay must start");
+        let url = relay.url();
+        relay.shutdown().await;
+
+        let transport = NostrTransport::connect(Keys::generate(), &[url])
+            .await
+            .expect("connect returns Ok even when the relay is down");
+        let health = transport.health().await;
+        assert_eq!(health.len(), 1);
+        assert!(
+            !health[0].connected,
+            "an unreachable relay must report not connected"
+        );
+        assert!(
+            health[0].latency_ms.is_none(),
+            "a disconnected relay must not report a latency probe"
+        );
+    }
+}
