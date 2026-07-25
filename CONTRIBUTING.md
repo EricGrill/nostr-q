@@ -37,6 +37,19 @@ cargo clippy --workspace --all-targets -- -D warnings
 Include the output summary in the PR description. If a check is not relevant or
 cannot run on your machine, say why.
 
+## Coverage
+
+CI measures line coverage with [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov)
+and fails the build if it drops below a floor. To reproduce locally:
+
+```sh
+cargo install cargo-llvm-cov          # once
+cargo llvm-cov --workspace --summary-only   # per-file + total summary
+cargo llvm-cov --workspace --html --open    # browsable line-by-line report
+```
+
+New behavior should come with tests; coverage is a backstop, not the goal.
+
 ## Project Expectations
 
 - Keep changes small and reviewable.
