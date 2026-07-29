@@ -640,6 +640,51 @@ mod tests {
     }
 
     #[test]
+    fn open_creates_missing_parent_directories() {
+        // The state path often points several levels below an as-yet
+        // nonexistent dir (e.g. `~/.local/share/nostr-q/state.db` on a fresh
+        // machine). `open` must create the whole chain rather than fail — the
+        // in-memory store used by every other test never exercises this.
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("a/b/c/state.db");
+        assert!(!nested.parent().unwrap().exists());
+        let store = Store::open(&nested).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 1);
+        assert!(nested.exists(), "the db file must exist on disk after open");
+    }
+
+    #[test]
+    fn move_to_dlq_at_errors_on_unknown_mid() {
+        // Guards the `n == 0` bail: dead-lettering a mid that isn't in the
+        // messages table must be a clean error, not a silent no-op that would
+        // leave callers believing a message was buried when it never existed.
+        let store = Store::open_in_memory().unwrap();
+        let err = store
+            .move_to_dlq_at("ghost", "boom", 3)
+            .expect_err("dead-lettering an unknown mid must error");
+        assert!(
+            err.to_string().contains("no message with mid ghost"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn stats_reports_oldest_pending_age_for_a_live_message() {
+        // Covers the `oldest = Some(..)` branch of `stats`: a pending message
+        // present means `oldest_pending_age_secs` is the age of the oldest
+        // pending row, which `nostr-q inspect` and the metrics exporter report.
+        let store = Store::open_in_memory().unwrap();
+        store.insert_message(&rec("m1", "q")).unwrap(); // created_at = 100
+        let stats = store.stats("q", 500).unwrap();
+        assert_eq!(stats.pending, 1);
+        assert_eq!(stats.oldest_pending_age_secs, Some(400));
+        // No pending rows in an empty queue => no age to report.
+        let empty = store.stats("other", 500).unwrap();
+        assert_eq!(empty.pending, 0);
+        assert_eq!(empty.oldest_pending_age_secs, None);
+    }
+
+    #[test]
     fn message_lifecycle_pending_claim_ack() {
         let store = Store::open_in_memory().unwrap();
         assert!(store.insert_message(&rec("m1", "q")).unwrap());

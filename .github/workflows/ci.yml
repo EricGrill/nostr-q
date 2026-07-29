@@ -36,3 +36,38 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      # Runs the whole suite instrumented, writes lcov for tooling, and fails
+      # the job if line coverage regresses below the floor. The floor sits a
+      # few points under current (~90%) so ordinary churn doesn't trip it while
+      # a real drop still does.
+      - name: Coverage (lcov + enforce floor)
+        run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info --fail-under-lines 85
+
+      - name: Coverage summary
+        run: cargo llvm-cov report --summary-only
+
+      - name: Upload lcov report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
