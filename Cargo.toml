@@ -30,7 +30,7 @@ ulid = "2"
 chrono = { version = "0.4", features = ["serde"] }
 nostr = "0.44"
 nostr-sdk = "0.44"
-tokio-tungstenite = "0.26"
+tokio-tungstenite = "0.30"
 rusqlite = { version = "0.40", features = ["bundled"] }
 clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.13", features = ["json"] }
