@@ -31,7 +31,7 @@ chrono = { version = "0.4", features = ["serde"] }
 nostr = "0.44"
 nostr-sdk = "0.44"
 tokio-tungstenite = "0.26"
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.13", features = ["json"] }
 axum = "0.8"
